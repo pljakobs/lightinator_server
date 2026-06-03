@@ -47,6 +47,10 @@ echo "==> Refreshing nginx config..."
 install -m 644 -o "${DEPLOY_USER}" -g nginx \
     "${REPO_DIR}/nginx/default.conf" \
     "${DEPLOY_HOME}/nginx/conf.d/default.conf"
+# Restore SELinux context so the nginx container (with container_file_t) can read it
+restorecon "${DEPLOY_HOME}/nginx/conf.d/default.conf" 2>/dev/null || \
+    chcon --reference="${DEPLOY_HOME}/nginx/conf.d/" \
+          "${DEPLOY_HOME}/nginx/conf.d/default.conf"
 podman exec nginx nginx -t && podman exec nginx nginx -s reload
 echo "    nginx reloaded"
 
