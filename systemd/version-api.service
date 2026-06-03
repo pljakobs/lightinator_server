@@ -1,0 +1,20 @@
+[Unit]
+Description=lightinator.de Version API
+Documentation=https://github.com/pjakobs/lightinator-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=github-deploy
+WorkingDirectory=/home/github-deploy/lightinator-server
+ExecStart=/usr/bin/python3 /home/github-deploy/lightinator-server/version_api.py
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,696 @@
+import json
+import os
+import sys
+import re
+import shutil
+import base64
+import requests
+from urllib.parse import urlparse
+
+def update_latest_symlink(data, base_dir='download/firmware'):
+    """
+    For each branch (develop, testing, main), create or update a symlink (or copy) in download/latest-<branch>/app_merged.bin
+    pointing to the latest single_image/app_merged.bin for that branch.
+    """
+    branches = ['develop', 'testing', 'main']
+    for branch in branches:
+        # Find all firmware entries for this branch and single_image builds
+        candidates = [e for e in data['firmware'] if e['branch'] == branch and 'single_image' in e['files']['rom']['url']]
+        if not candidates:
+            continue
+        # Sort by version (descending)
+        candidates.sort(key=lambda e: extract_complete_version_number(e['fw_version']), reverse=True)
+        latest = candidates[0]
+        url = latest['files']['rom']['url']
+        # Extract the local path to app_merged.bin
+        parsed = urlparse(url)
+        rel_path = parsed.path.lstrip('/')
+        if rel_path.startswith(base_dir.rstrip('/') + '/'):
+            src_path = rel_path
+        elif rel_path.startswith('download/'):
+            src_path = rel_path
+        else:
+            src_path = os.path.join(base_dir, rel_path)
+        # Target symlink directory
+        link_dir = os.path.join(base_dir, f'latest-{branch}')
+        os.makedirs(link_dir, exist_ok=True)
+        link_path = os.path.join(link_dir, 'app_merged.bin')
+        # Remove old symlink or file if exists
+        if os.path.islink(link_path) or os.path.exists(link_path):
+            os.remove(link_path)
+        try:
+            os.symlink(os.path.abspath(src_path), link_path)
+            print(f"Created symlink: {link_path} -> {src_path}")
+        except Exception as e:
+            print(f"Failed to create symlink for {branch}: {e}")
+
+
+def load_json(file_path_or_url):
+    # Check if the input is a URL
+    if file_path_or_url.startswith('http://') or file_path_or_url.startswith('https://'):
+        try:
+            response = requests.get(file_path_or_url, timeout=10)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching from URL: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON from URL: {e}")
+            return None
+    
+    # Handle local file
+    if not os.path.exists(file_path_or_url):
+        return None
+    with open(file_path_or_url, 'r') as file:
+        try:
+            return json.load(file)
+        except json.JSONDecodeError:
+            return None
+
+def save_json(data, file_path):
+    with open(file_path, 'w') as file:
+        json.dump(data, file, indent=4)
+
+def prime_json(file_path):
+    data = {
+        "rom": {
+            "fw_version": "pj-1-656-g3119",
+            "url": "http://lightinator.de/download/esp8266/develop/release/rom0.bin"
+        },
+        "spiffs": {
+            "webapp_version": "0.3.3",
+            "url": "http://rgbww.dronezone.de/testing/spiff_rom.bin"
+        },
+        "firmware": [],
+        "history": []  # Add the history array to the base structure
+    }
+    save_json(data, file_path)
+    return data
+
+def extract_build_number(version_string):
+    """Extract prerelease/build number from old and new version strings."""
+    return parse_version_components(version_string)[3]
+
+def get_version_limit(branch):
+    """Get maximum number of versions to keep based on branch"""
+    if branch == 'stable':
+        return 4
+    elif branch == 'testing':
+        return 4
+    else:  # develop or any other branch
+        return 10
+
+def extract_directory_from_url(url):
+    """Extract the directory path from a URL"""
+    parsed_url = urlparse(url)
+    path = parsed_url.path
+    # Remove the filename from the path
+    directory = os.path.dirname(path)
+    return directory
+
+def parse_version_components(version_string):
+    """Parse old and new firmware version formats into sortable components."""
+    normalized = version_string.strip().lstrip('Vv')
+    if not normalized:
+        return (0, 0, 0, 0)
+
+    segments = normalized.split('-')
+    base_parts = segments[0].split('.')
+
+    try:
+        major = int(base_parts[0]) if len(base_parts) > 0 else 0
+        minor = int(base_parts[1]) if len(base_parts) > 1 else 0
+        patch = int(base_parts[2]) if len(base_parts) > 2 else 0
+    except ValueError:
+        return (0, 0, 0, 0)
+
+    prerelease = 0
+    if len(segments) > 1 and segments[1].isdigit():
+        prerelease = int(segments[1])
+
+    return (major, minor, patch, prerelease)
+
+def add_or_update_entry(data, soc, type_, branch, fw_version, url, comment=''):
+    # Make sure history array exists
+    if "history" not in data:
+        data["history"] = []
+    
+    # Debug: Print the entry we're trying to add
+    print(f"Adding/updating: {soc}/{type_}/{branch}: {fw_version}")
+    print(f"Current firmware entries: {len(data['firmware'])}")
+    
+    # Normalize inputs to prevent case/whitespace issues
+    soc = soc.strip().lower()
+    type_ = type_.strip().lower()
+    branch = branch.strip().lower()
+    comment = comment or ''
+    
+    # First check if entry already exists and update it if it does
+    entry_exists = False
+    for i, entry in enumerate(data['firmware']):
+        # Normalize existing entry data for comparison
+        entry_soc = entry['soc'].strip().lower()
+        entry_type = entry['type'].strip().lower()
+        entry_branch = entry['branch'].strip().lower()
+        
+        # Debug: Print comparison details
+        print(f"Comparing with: {entry_soc}/{entry_type}/{entry_branch}")
+        
+        if (entry_soc == soc and
+            entry_type == type_ and
+            entry_branch == branch):
+            # Found matching entry
+            print(f"Match found: {entry['soc']}/{entry['type']}/{entry['branch']}")
+            
+            # Keep original case for the entry we're updating
+            original_soc = entry['soc']
+            original_type = entry['type']
+            original_branch = entry['branch']
+            existing_comment = entry.get('comment', '')
+            updated_comment = comment if comment else existing_comment
+            
+            if entry['fw_version'] == fw_version:
+                # Update existing entry with same version - no history change
+                print(f"Same version, just updating URL")
+                data['firmware'][i] = {
+                    "soc": original_soc,
+                    "type": original_type,
+                    "branch": original_branch,
+                    "fw_version": fw_version,
+                    "version":fw_version,
+                    "comment": updated_comment,
+                    # Add version key for backward compatibility
+                    "files": {
+                        "rom": {
+                            "url": url
+                        }
+                    }
+                }
+            else:
+                # Same combination but different version - move to history
+                print(f"Moving {original_soc}/{original_type}/{original_branch}: {entry['fw_version']} to history")
+                # Create a copy to avoid reference is=sues
+                history_entry = dict(entry)
+                data['history'].append(history_entry)
+                
+                # Replace with new version
+                data['firmware'][i] = {
+                    "soc": original_soc,
+                    "type": original_type,
+                    "branch": original_branch,
+                    "fw_version": fw_version,
+                    "version":fw_version,
+                    "comment": comment,
+                    "files": {
+                        "rom": {
+                            "url": url
+                        }
+                    }
+                }
+            entry_exists = True
+            break
+    
+    # If no matching soc/type/branch entry exists, add it
+    if not entry_exists:
+        print(f"No existing entry found, adding new one")
+        # Add the new entry
+        new_entry = {
+            "soc": soc,
+            "type": type_,
+            "branch": branch,
+            "fw_version": fw_version,
+            "version":fw_version,
+            "comment": comment,
+            "files": {
+                "rom": {
+                    "url": url
+                }
+            }
+        }
+        data['firmware'].append(new_entry)
+    
+    # Update the top-level rom entry for backward compatibility
+    if soc == 'esp8266' and type_ == 'release' and branch == 'testing':
+        data['rom'] = {
+            "fw_version": fw_version,
+            "url": url
+        }
+    
+    # Debug: Final state
+    print(f"Final firmware entries: {len(data['firmware'])}")
+    print(f"Final history entries: {len(data['history'])}")
+    
+    return data
+
+def delete_entry(data, soc, type_, branch, fw_version=None, delete_files=False):
+    entries_to_delete = []
+    
+    # Find entries to delete from firmware array
+    if fw_version:
+        # Delete specific version
+        entries_to_delete = [entry for entry in data['firmware'] 
+                            if (entry['soc'] == soc and 
+                                entry['type'] == type_ and 
+                                entry['branch'] == branch and 
+                                entry['fw_version'] == fw_version)]
+        data['firmware'] = [entry for entry in data['firmware'] 
+                           if not (entry['soc'] == soc and 
+                                  entry['type'] == type_ and 
+                                  entry['branch'] == branch and 
+                                  entry['fw_version'] == fw_version)]
+                                  
+        # Also remove from history if present
+        history_entries_to_delete = [entry for entry in data.get('history', []) 
+                                    if (entry['soc'] == soc and 
+                                        entry['type'] == type_ and 
+                                        entry['branch'] == branch and 
+                                        entry['fw_version'] == fw_version)]
+        if 'history' in data:
+            data['history'] = [entry for entry in data['history'] 
+                              if not (entry['soc'] == soc and 
+                                      entry['type'] == type_ and 
+                                      entry['branch'] == branch and 
+                                      entry['fw_version'] == fw_version)]
+        
+        entries_to_delete.extend(history_entries_to_delete)
+    else:
+        # Delete all versions for this combination
+        entries_to_delete = [entry for entry in data['firmware'] 
+                            if (entry['soc'] == soc and 
+                                entry['type'] == type_ and 
+                                entry['branch'] == branch)]
+        data['firmware'] = [entry for entry in data['firmware'] 
+                           if not (entry['soc'] == soc and 
+                                  entry['type'] == type_ and 
+                                  entry['branch'] == branch)]
+                                  
+        # Also remove from history if present
+        if 'history' in data:
+            history_entries_to_delete = [entry for entry in data['history'] 
+                                        if (entry['soc'] == soc and 
+                                            entry['type'] == type_ and 
+                                            entry['branch'] == branch)]
+            data['history'] = [entry for entry in data['history'] 
+                              if not (entry['soc'] == soc and 
+                                      entry['type'] == type_ and 
+                                      entry['branch'] == branch)]
+            
+# ...existing code...
+
+# Place this function after all imports, before main()
+            entries_to_delete.extend(history_entries_to_delete)
+    
+    # Delete corresponding directories if requested
+    if delete_files:
+        for entry in entries_to_delete:
+            try:
+                url = entry['files']['rom']['url']
+                directory = extract_directory_from_url(url)
+                local_dir = os.path.join('.', directory.lstrip('/'))
+                
+                # Get version directory (one level up from SOC/type)
+                version_dir = os.path.dirname(os.path.dirname(local_dir))
+                
+                print(f"Deleting directory: {version_dir}")
+                if os.path.exists(version_dir):
+                    shutil.rmtree(version_dir)
+                else:
+                    print(f"Directory not found: {version_dir}")
+            except Exception as e:
+                print(f"Error deleting directory: {str(e)}")
+    
+    return data
+
+def is_url_accessible(url):
+    """Check if a URL is accessible (returns 200 status code)"""
+    try:
+        response = requests.head(url, timeout=5)
+        if response.status_code == 405:  # Method not allowed, try GET instead
+            response = requests.get(url, timeout=5, stream=True)
+            response.close()  # Don't download the whole file
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+def list_entries(data, soc=None, type_=None, branch=None, include_history=False, check_urls=False):
+    # Get entries from firmware array
+    filtered_entries = data['firmware']
+    
+    if soc:
+        filtered_entries = [e for e in filtered_entries if e['soc'] == soc]
+    if type_:
+        filtered_entries = [e for e in filtered_entries if e['type'] == type_]
+    if branch:
+        filtered_entries = [e for e in filtered_entries if e['branch'] == branch]
+    
+    # Include history entries if requested
+    if include_history and 'history' in data:
+        history_entries = data['history']
+        
+        if soc:
+            history_entries = [e for e in history_entries if e['soc'] == soc]
+        if type_:
+            history_entries = [e for e in history_entries if e['type'] == type_]
+        if branch:
+            history_entries = [e for e in history_entries if e['branch'] == branch]
+            
+        # Combine entries but mark history entries
+        for entry in history_entries:
+            entry['is_history'] = True
+            
+        for entry in filtered_entries:
+            entry['is_history'] = False
+            
+        filtered_entries.extend(history_entries)
+    
+    # Check URL accessibility if requested
+    if check_urls:
+        for entry in filtered_entries:
+            try:
+                url = entry['files']['rom']['url']
+                entry['url_accessible'] = is_url_accessible(url)
+            except KeyError:
+                entry['url_accessible'] = False
+    
+    return filtered_entries
+
+def extract_complete_version_number(version_string):
+    """Extract a sortable number from old and new firmware version strings."""
+    major, minor, patch, prerelease = parse_version_components(version_string)
+    return major * 1000000000 + minor * 1000000 + patch * 1000 + prerelease
+
+def cull_history(data, dry_run=False):
+    """Limit the number of historical versions based on branch limits"""
+    if "history" not in data or not data["history"]:
+        print("No history entries to cull")
+        return data
+    
+    # Group entries by soc+type+branch
+    grouped_entries = {}
+    for entry in data["history"]:
+        key = (entry["soc"], entry["type"], entry["branch"])
+        if key not in grouped_entries:
+            grouped_entries[key] = []
+        grouped_entries[key].append(entry)
+    
+    # Print summary of entries by type before culling
+    print("\nHistory entries before culling:")
+    for (soc, type_, branch), entries in sorted(grouped_entries.items()):
+        print(f"  {soc}/{type_}/{branch}: {len(entries)} entries")
+    print(f"  Total: {len(data['history'])} entries")
+    
+    entries_to_remove = []
+# ...existing code...
+
+# Place this function after all imports, before main()
+    
+    # Process each group
+    for (soc, type_, branch), entries in grouped_entries.items():
+        # Sort by version (descending)
+        sorted_entries = sorted(entries, 
+                               key=lambda e: extract_complete_version_number(e["fw_version"]), 
+                               reverse=True)
+        
+        # Get limit for this branch
+        limit = get_version_limit(branch)
+        
+        # Keep only the top N entries
+        if len(sorted_entries) > limit:
+            entries_to_keep = sorted_entries[:limit]
+            to_remove = sorted_entries[limit:]
+            
+            print(f"For {soc}/{type_}/{branch}: keeping {limit} entries, removing {len(to_remove)} entries")
+            
+            # Add entries to remove list
+            entries_to_remove.extend(to_remove)
+            
+            if dry_run:
+                for entry in to_remove:
+                    print(f"Would remove: {entry['soc']}/{entry['type']}/{entry['branch']}: {entry['fw_version']}")
+    
+    if not entries_to_remove:
+        print("No entries need to be culled")
+        return data
+    
+    if not dry_run:
+        # Remove entries from history
+        for entry in entries_to_remove:
+            # Delete files if they exist
+            try:
+                url = entry['files']['rom']['url']
+                directory = extract_directory_from_url(url)
+                local_dir = os.path.join('.', directory.lstrip('/'))
+                
+                # Get version directory (one level up from SOC/type)
+                version_dir = os.path.dirname(os.path.dirname(local_dir))
+                
+                print(f"Deleting directory: {version_dir}")
+                if os.path.exists(version_dir):
+                    shutil.rmtree(version_dir)
+                else:
+                    print(f"Directory not found: {version_dir}")
+            except Exception as e:
+                print(f"Error deleting directory: {str(e)}")
+        
+        # Update history array to exclude removed entries
+        data["history"] = [entry for entry in data["history"] 
+                         if entry not in entries_to_remove]
+    
+    # Print summary of entries by type after culling
+    if not dry_run or entries_to_remove:
+        # Re-group entries after culling
+        new_grouped_entries = {}
+        for entry in data["history"]:
+            key = (entry["soc"], entry["type"], entry["branch"])
+            if key not in new_grouped_entries:
+                new_grouped_entries[key] = []
+            new_grouped_entries[key].append(entry)
+        
+        print("\nHistory entries after culling:")
+        for (soc, type_, branch), entries in sorted(new_grouped_entries.items()):
+            print(f"  {soc}/{type_}/{branch}: {len(entries)} entries")
+        print(f"  Total: {len(data['history'])} entries")
+    
+    return data
+
+def add_or_update_webapp_entry(data, branch, version, files=None, comment='', webapp_type='debug', min_firmware=''):
+    """Add or update a webapp entry in version.json."""
+    if "webapp" not in data:
+        data["webapp"] = []
+    if "webapp_history" not in data:
+        data["webapp_history"] = []
+    files = files or []
+    branch = branch.strip().lower()
+    webapp_type = webapp_type.strip().lower() if webapp_type else 'debug'
+    if webapp_type not in ('debug', 'release'):
+        print(f"Invalid webapp type '{webapp_type}', defaulting to 'debug'")
+        webapp_type = 'debug'
+    min_firmware = min_firmware.strip()
+    comment = comment or ''
+
+    for i, entry in enumerate(data["webapp"]):
+        if entry["branch"].strip().lower() == branch:
+            if entry["version"] == version:
+                data["webapp"][i] = {
+                    "version": version,
+                    "type": webapp_type,
+                    "branch": entry["branch"],
+                    "min_firmware": min_firmware,
+                    "files": files,
+                    "comment": comment if comment else entry.get("comment", "")
+                }
+                print(f"Updated webapp entry for {branch} version {version} (same version, metadata/files updated)")
+            else:
+                print(f"Moving webapp {branch}: {entry['version']} to history")
+                data["webapp_history"].append(dict(entry))
+                data["webapp"][i] = {
+                    "version": version,
+                    "type": webapp_type,
+                    "branch": branch,
+                    "min_firmware": min_firmware,
+                    "files": files,
+                    "comment": comment
+                }
+                print(f"Added new webapp entry for {branch} version {version}")
+            return data
+
+    data["webapp"].append({
+        "version": version,
+        "type": webapp_type,
+        "branch": branch,
+        "min_firmware": min_firmware,
+        "files": files,
+        "comment": comment
+    })
+    print(f"Added new webapp entry for {branch} version {version}")
+    return data
+
+
+def list_webapp_entries(data, branch=None):
+    """List webapp entries, optionally filtered by branch."""
+    entries = data.get("webapp", [])
+    if branch:
+        branch = branch.strip().lower()
+        entries = [e for e in entries if e["branch"].strip().lower() == branch]
+    return entries
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: script.py <json_file_or_url> [add|delete|list|cull] [arguments]")
+        return
+
+    file_path_or_url = sys.argv[1]
+    action = sys.argv[2]
+
+    # Load the data
+    data = load_json(file_path_or_url)
+    if data is None:
+        if not (file_path_or_url.startswith('http://') or file_path_or_url.startswith('https://')):
+            # Only create a new file if it's a local path
+            pass
+        return
+
+    if action == 'add':
+        if len(sys.argv) < 8:
+            print("Usage: script.py <json_file> add <soc> <type> <branch> <fw_version> <url> [--comment-b64 <base64>]")
+            return
+        soc = sys.argv[3]
+        type_ = sys.argv[4]
+        branch = sys.argv[5]
+        fw_version = sys.argv[6]
+        url = sys.argv[7]
+        comment = ''
+        args = sys.argv[8:]
+        idx = 0
+        while idx < len(args):
+            if args[idx] == '--comment-b64' and idx + 1 < len(args):
+                try:
+                    comment = base64.b64decode(args[idx + 1]).decode('utf-8')
+                except Exception as exc:
+                    print(f"Error decoding --comment-b64: {exc}")
+                    return
+                idx += 2
+            else:
+                idx += 1
+        data = add_or_update_entry(data, soc, type_, branch, fw_version, url, comment)
+        save_json(data, file_path_or_url)
+        update_latest_symlink(data)
+        print(f"Entry added/updated for {soc}/{type_}/{branch} version {fw_version}.")
+        return
+
+    if action == 'delete':
+        if len(sys.argv) < 6:
+            print("Usage: script.py <json_file> delete <soc> <type> <branch> [fw_version] [--keep-files]")
+            return
+        soc = sys.argv[3]
+        type_ = sys.argv[4]
+        branch = sys.argv[5]
+        fw_version = None
+        delete_files = True
+        for arg in sys.argv[6:]:
+            if arg == '--keep-files':
+                delete_files = False
+            elif not fw_version:
+                fw_version = arg
+        data = delete_entry(data, soc, type_, branch, fw_version, delete_files)
+        save_json(data, file_path_or_url)
+        update_latest_symlink(data)
+        print(f"Entry deleted for {soc}/{type_}/{branch} version {fw_version}.")
+        return
+
+    if action == 'cull':
+        dry_run = False
+        for arg in sys.argv[3:]:
+            if arg == '--dry-run':
+                dry_run = True
+        print(f"Culling history entries (dry run: {dry_run})")
+        data = cull_history(data, dry_run)
+        if not dry_run:
+            save_json(data, file_path_or_url)
+            update_latest_symlink(data)
+        return
+
+    if action == 'list':
+        soc = None
+        type_ = None
+        branch = None
+        include_history = False
+        check_urls = False
+        # Parse arguments
+        for arg in sys.argv[3:]:
+            if arg == '--history':
+                include_history = True
+            elif arg == '--check-urls':
+                check_urls = True
+            elif soc is None:
+                soc = arg
+            elif type_ is None:
+                type_ = arg
+            elif branch is None:
+                branch = arg
+        entries = list_entries(data, soc, type_, branch, include_history, check_urls)
+        print(f"Found {len(entries)} entries:")
+        for entry in sorted(entries, key=lambda e: (e['branch'], e['soc'], e['type'], extract_build_number(e['fw_version']), e.get('is_history', False)), reverse=True):
+            history_marker = "[HISTORY] " if entry.get('is_history', False) else ""
+            url_status = " [✓]" if check_urls and entry.get('url_accessible', False) else " [✗]" if check_urls else ""
+            print(f"{history_marker}{entry['soc']}/{entry['type']}/{entry['branch']}: {entry['fw_version']}{url_status} - {entry['files']['rom']['url']}")
+        return
+
+    if action == 'add-webapp':
+        if len(sys.argv) < 5:
+            print("Usage: script.py <json_file> add-webapp <branch> <version> [--files-json-b64 <base64>] [--comment-b64 <base64>] [--type <debug|release>] [--min-firmware <semver>]")
+            return
+        branch = sys.argv[3]
+        version = sys.argv[4]
+        files = []
+        comment = ''
+        webapp_type = 'debug'
+        min_firmware = ''
+        args = sys.argv[5:]
+        idx = 0
+        while idx < len(args):
+            if args[idx] == '--files-json-b64' and idx + 1 < len(args):
+                try:
+                    files = json.loads(base64.b64decode(args[idx + 1]).decode('utf-8'))
+                except Exception as exc:
+                    print(f"Error decoding --files-json-b64: {exc}")
+                    return
+                idx += 2
+            elif args[idx] == '--comment-b64' and idx + 1 < len(args):
+                try:
+                    comment = base64.b64decode(args[idx + 1]).decode('utf-8')
+                except Exception as exc:
+                    print(f"Error decoding --comment-b64: {exc}")
+                    return
+                idx += 2
+            elif args[idx] == '--type' and idx + 1 < len(args):
+                webapp_type = args[idx + 1]
+                idx += 2
+            elif args[idx] == '--min-firmware' and idx + 1 < len(args):
+                min_firmware = args[idx + 1]
+                idx += 2
+            else:
+                idx += 1
+        data = add_or_update_webapp_entry(data, branch, version, files, comment, webapp_type, min_firmware)
+        save_json(data, file_path_or_url)
+        print(f"Webapp entry added/updated for {branch} version {version}.")
+        return
+
+    if action == 'list-webapp':
+        branch = sys.argv[3] if len(sys.argv) > 3 else None
+        entries = list_webapp_entries(data, branch)
+        print(f"Found {len(entries)} webapp entries:")
+        for entry in sorted(entries, key=lambda e: e['branch']):
+            files_count = len(entry.get("files", []))
+            entry_type = entry.get("type", "unknown")
+            min_fw = entry.get("min_firmware", "")
+            min_fw_text = f" min_firmware={min_fw}" if min_fw else ""
+            print(f"  {entry['branch']}: {entry['version']} type={entry_type}{min_fw_text} ({files_count} files)")
+        return
+
+    print("Invalid action. Use add, delete, list, cull, add-webapp, or list-webapp.")
+
+if __name__ == "__main__":
+    main()

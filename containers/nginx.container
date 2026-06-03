@@ -1,0 +1,26 @@
+[Unit]
+Description=Nginx Reverse Proxy Quadlet
+After=network-online.target
+
+[Container]
+Image=docker.io/nginx:latest
+ContainerName=nginx
+PublishPort=80:80
+PublishPort=443:443
+
+# Connect to the monitoring stack network so it can see Grafana
+Network=monitoring.network
+
+# Mounts (using :Z for SELinux labeling)
+Volume=/home/github-deploy/nginx/conf.d:/etc/nginx/conf.d:Z
+Volume=/home/github-deploy/nginx/html:/usr/share/nginx/html:Z
+Volume=/etc/letsencrypt:/etc/letsencrypt:Z
+Volume=/home/github-deploy/nginx/logs:/var/log/nginx:Z
+
+Label=io.containers.autoupdate=image
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
