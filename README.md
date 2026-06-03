@@ -7,7 +7,7 @@ Server-side configuration and tooling for [lightinator.de](https://lightinator.d
 | Path | Description |
 |------|-------------|
 | `manage_version.py` | CLI tool to manage `version.json` (canonical home — firmware repo carries a copy) |
-| `version_api.py` | Read-only HTTP API over `version.json`, listens on `127.0.0.1:8765` |
+| `version_api.py` | Read-only HTTP API over `version.json`, listens on `0.0.0.0:8765` (host); nginx container proxies `/api/` via `host.containers.internal:8765` |
 | `containers/nginx.container` | Podman Quadlet unit for the nginx reverse proxy |
 | `nginx/default.conf` | nginx site config — deployed to `/home/github-deploy/nginx/conf.d/` |
 | `fail2ban/filter.d/` | Custom fail2ban filters (gh-knocker, nginx-podlet-access) |

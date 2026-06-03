@@ -2,7 +2,11 @@
 """
 lightinator.de Version API
 Read-only HTTP API over version.json for firmware and webapp version queries.
-Listens on 127.0.0.1:8765; nginx proxies /api/ to it.
+
+Listens on 0.0.0.0:8765 (all interfaces on the host). nginx runs in a Podman
+container and cannot reach the host via 127.0.0.1; it connects via
+host.containers.internal:8765 instead. Port 8765 is not opened in the
+firewall, so it is only reachable from the container network.
 """
 
 import json
@@ -16,7 +20,7 @@ VERSION_JSON_PATH = os.environ.get(
     "VERSION_JSON_PATH",
     "/home/github-deploy/nginx/html/version.json",
 )
-LISTEN_HOST = "127.0.0.1"
+LISTEN_HOST = os.environ.get("VERSION_API_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VERSION_API_PORT", "8765"))
 CACHE_TTL = 10  # seconds
 
