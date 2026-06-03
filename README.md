@@ -130,7 +130,7 @@ ssh lightinator.de "cat >> /home/github-deploy/.ssh/authorized_keys" \
 
 ## Initial setup
 
-Clone the repo to the server and run the bootstrap script as root:
+Clone the repo to the server and run the bootstrap script as root:file:///
 
 ```bash
 git clone https://github.com/pljakobs/lightinator_server.git \
@@ -162,15 +162,110 @@ sudo bash /home/github-deploy/lightinator-server/deploy/update.sh
 `version_api.py` exposes a read-only JSON API backed by `version.json`.
 nginx proxies `/api/` to `http://host.containers.internal:8765/api/`.
 
-Key endpoints:
+### Concepts
+
+The firmware catalogue is an **n-cube** with three axes. Any combination of
+axis filters can be applied; omitting an axis returns all values on that axis.
+
+| Axis | Values (example) |
+|------|-----------------|
+| `soc` | `esp8266`, `esp32`, `esp32c3` |
+| `branch` | `testing`, `develop`, `experimental`, `crash-reporting` |
+| `type` | `release`, `debug` |
+
+The webapp catalogue has one axis: `branch`.
+
+Version strings follow the pattern `V<major>.<minor>-<build>[-<suffix>]`
+(e.g. `V5.0-599-testing`). The trailing `-<suffix>` is ignored during
+comparison; only `<major>.<minor>-<build>` is used for ordering. The raw
+device firmware version string can be passed directly to `firmware_version=`.
+
+### Discovery endpoints
+
 ```
-GET /api/firmware/<soc>/latest/<branch>/<type>
-GET /api/webapp/latest/<branch>?firmware_version=<ver>
-GET /api/firmware/<soc>/branches
+GET /api/firmware/socs[?branch=<branch>][&type=<type>]
+    → ["esp32", "esp32c3", "esp8266"]
+
+GET /api/firmware/branches[?soc=<soc>][&type=<type>]
+    → ["crash-reporting", "develop", "experimental", "testing"]
+
+GET /api/firmware/types[?soc=<soc>][&branch=<branch>]
+    → ["debug", "release"]
+
 GET /api/webapp/branches
+    → ["experimental"]
 ```
 
-See [plan.md](plan.md) Phase 6 for the full URL structure and semantics.
+### Firmware version queries
+
+All three filter parameters are optional. Omit any axis to slice across all its values.
+
+```
+GET /api/firmware/versions[?soc=<soc>][&branch=<branch>][&type=<type>]
+```
+Returns all matching firmware entries sorted newest-first.
+
+```
+GET /api/firmware/latest[?soc=<soc>][&branch=<branch>][&type=<type>]
+```
+When all three axes are specified, returns a single object.
+When one or more axes are omitted, returns an array — one entry per unique
+`(soc, branch, type)` combination, each being the latest in its group.
+
+**Firmware entry object:**
+```json
+{
+  "version": "V5.0-599-testing",
+  "soc":     "esp32",
+  "branch":  "testing",
+  "type":    "release",
+  "url":     "https://lightinator.de/download/testing/V5.0-599-testing/esp32/release/app.bin",
+  "comment": ""
+}
+```
+
+### Webapp version queries
+
+```
+GET /api/webapp/versions[?branch=<branch>][&firmware_version=<ver>]
+GET /api/webapp/latest[?branch=<branch>][&firmware_version=<ver>]
+```
+`firmware_version` filters out webapp entries whose `min_firmware` requirement
+is not satisfied. When `branch` is omitted, `/latest` returns one entry per branch.
+
+**Webapp entry object:**
+```json
+{
+  "version":      "V5.0-316-experimental",
+  "branch":       "experimental",
+  "type":         "release",
+  "min_firmware": "",
+  "files":        [],
+  "comment":      ""
+}
+```
+
+### Example workflow
+
+```bash
+# What SOCs are available?
+curl https://lightinator.de/api/firmware/socs
+
+# What branches exist for esp32?
+curl "https://lightinator.de/api/firmware/branches?soc=esp32"
+
+# All debug builds for esp32 (across all branches), newest first:
+curl "https://lightinator.de/api/firmware/versions?soc=esp32&type=debug"
+
+# Latest release firmware for esp32, testing branch:
+curl "https://lightinator.de/api/firmware/latest?soc=esp32&branch=testing&type=release"
+
+# Latest of every (soc, branch, type) combination — full overview:
+curl https://lightinator.de/api/firmware/latest
+
+# Latest webapp compatible with a specific firmware version:
+curl "https://lightinator.de/api/webapp/latest?branch=experimental&firmware_version=V5.0-599-testing"
+```
 
 ## Port knocking
 

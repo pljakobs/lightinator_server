@@ -160,109 +160,156 @@ class VersionAPIHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------
     # Firmware routes
+    #
+    # All filter axes are optional query parameters:
+    #   ?soc=<soc>  &branch=<branch>  &type=<type>
+    #
+    # Endpoints:
+    #   GET /api/firmware/socs
+    #   GET /api/firmware/branches[?soc=][&type=]
+    #   GET /api/firmware/types[?soc=][&branch=]
+    #   GET /api/firmware/versions[?soc=][&branch=][&type=]
+    #   GET /api/firmware/latest[?soc=][&branch=][&type=]
     # ------------------------------------------------------------------
 
     def _handle_firmware(self, parts, qs, data):
-        firmware = data.get("firmware", [])
+        all_entries = data.get("firmware", []) + data.get("history", [])
 
-        # /firmware/<soc>/branches
-        if len(parts) == 2 and parts[1] == "branches":
-            soc = parts[0]
-            branches = sorted({e["branch"] for e in firmware if e.get("soc", "").lower() == soc})
+        soc    = (qs.get("soc")    or [None])[0]
+        branch = (qs.get("branch") or [None])[0]
+        ftype  = (qs.get("type")   or [None])[0]
+
+        def fw_ver(e):
+            return e.get("fw_version", e.get("version", ""))
+
+        def apply_filters(entries):
+            return [
+                e for e in entries
+                if (soc    is None or e.get("soc",    "").lower() == soc.lower())
+                and (branch is None or e.get("branch", "")         == branch)
+                and (ftype  is None or e.get("type",   "")         == ftype)
+            ]
+
+        if not parts:
+            not_found(self)
+            return
+
+        resource = parts[0]
+
+        # /firmware/socs — list distinct SOC values (filters: branch, type)
+        if resource == "socs":
+            entries = apply_filters(all_entries)
+            socs = sorted({e.get("soc", "") for e in entries if e.get("soc")})
+            json_response(self, 200, socs)
+
+        # /firmware/branches — list distinct branch values (filters: soc, type)
+        elif resource == "branches":
+            entries = apply_filters(all_entries)
+            branches = sorted({e.get("branch", "") for e in entries if e.get("branch")})
             json_response(self, 200, branches)
 
-        # /firmware/<soc>/versions[/<branch>[/<type>]]
-        elif len(parts) >= 2 and parts[1] == "versions":
-            soc = parts[0]
-            branch_filter = parts[2] if len(parts) > 2 else None
-            type_filter = parts[3] if len(parts) > 3 else None
+        # /firmware/types — list distinct type values (filters: soc, branch)
+        elif resource == "types":
+            entries = apply_filters(all_entries)
+            types = sorted({e.get("type", "") for e in entries if e.get("type")})
+            json_response(self, 200, types)
 
-            entries = [
-                e for e in firmware
-                if e.get("soc", "").lower() == soc
-                and (branch_filter is None or e.get("branch") == branch_filter)
-                and (type_filter is None or e.get("type") == type_filter)
-            ]
-            # Also include history entries
-            history = data.get("history", [])
-            entries += [
-                e for e in history
-                if e.get("soc", "").lower() == soc
-                and (branch_filter is None or e.get("branch") == branch_filter)
-                and (type_filter is None or e.get("type") == type_filter)
-            ]
-            entries.sort(
-                key=lambda e: parse_version_components(e.get("fw_version", e.get("version", ""))),
-                reverse=True,
-            )
+        # /firmware/versions — all matching entries, newest first
+        elif resource == "versions":
+            entries = apply_filters(all_entries)
+            entries.sort(key=lambda e: parse_version_components(fw_ver(e)), reverse=True)
             json_response(self, 200, [firmware_entry_to_dict(e) for e in entries])
 
-        # /firmware/<soc>/latest/<branch>/<type>
-        elif len(parts) == 4 and parts[1] == "latest":
-            soc, _, branch, fw_type = parts
-            candidates = [
-                e for e in firmware
-                if e.get("soc", "").lower() == soc
-                and e.get("branch") == branch
-                and e.get("type") == fw_type
-            ]
-            if not candidates:
-                not_found(self, f"no {soc}/{branch}/{fw_type} firmware entry")
+        # /firmware/latest — newest entry per unique (soc, branch, type) slice
+        elif resource == "latest":
+            entries = apply_filters(all_entries)
+            if not entries:
+                not_found(self, f"no firmware matching soc={soc} branch={branch} type={ftype}")
                 return
-            best = max(
-                candidates,
-                key=lambda e: parse_version_components(e.get("fw_version", e.get("version", ""))),
-            )
-            json_response(self, 200, firmware_entry_to_dict(best))
+            # When all three axes are fixed, return a single object.
+            # Otherwise return one latest entry per unique remaining combination.
+            if soc is not None and branch is not None and ftype is not None:
+                best = max(entries, key=lambda e: parse_version_components(fw_ver(e)))
+                json_response(self, 200, firmware_entry_to_dict(best))
+            else:
+                groups: dict = {}
+                for e in entries:
+                    key = (e.get("soc", ""), e.get("branch", ""), e.get("type", ""))
+                    if key not in groups or (
+                        parse_version_components(fw_ver(e))
+                        > parse_version_components(fw_ver(groups[key]))
+                    ):
+                        groups[key] = e
+                result = sorted(groups.values(), key=lambda e: (e.get("soc", ""), e.get("branch", ""), e.get("type", "")))
+                json_response(self, 200, [firmware_entry_to_dict(e) for e in result])
 
         else:
             not_found(self)
 
     # ------------------------------------------------------------------
     # Webapp routes
+    #
+    # Filter axes are optional query parameters:
+    #   ?branch=<branch>  &firmware_version=<ver>
+    #
+    # Endpoints:
+    #   GET /api/webapp/branches
+    #   GET /api/webapp/versions[?branch=][&firmware_version=]
+    #   GET /api/webapp/latest[?branch=][&firmware_version=]
     # ------------------------------------------------------------------
 
     def _handle_webapp(self, parts, qs, data):
-        webapp = data.get("webapp", [])
+        all_entries = data.get("webapp", []) + data.get("webapp_history", [])
+
+        branch           = (qs.get("branch")           or [None])[0]
         firmware_version = (qs.get("firmware_version") or [None])[0]
 
+        def apply_filters(entries):
+            filtered = [e for e in entries if branch is None or e.get("branch") == branch]
+            if firmware_version:
+                filtered = [
+                    e for e in filtered
+                    if not e.get("min_firmware") or version_ge(firmware_version, e["min_firmware"])
+                ]
+            return filtered
+
+        if not parts:
+            not_found(self)
+            return
+
+        resource = parts[0]
+
         # /webapp/branches
-        if len(parts) == 1 and parts[0] == "branches":
-            branches = sorted({e["branch"] for e in webapp})
+        if resource == "branches":
+            branches = sorted({e.get("branch", "") for e in all_entries if e.get("branch")})
             json_response(self, 200, branches)
 
-        # /webapp/versions/<branch>
-        elif len(parts) == 2 and parts[0] == "versions":
-            branch = parts[1]
-            entries = [e for e in webapp if e.get("branch") == branch]
-            # Include webapp_history for the same branch
-            history = data.get("webapp_history", [])
-            entries += [e for e in history if e.get("branch") == branch]
-            if firmware_version:
-                entries = [
-                    e for e in entries
-                    if not e.get("min_firmware") or version_ge(firmware_version, e["min_firmware"])
-                ]
-            entries.sort(
-                key=lambda e: parse_version_components(e.get("version", "")),
-                reverse=True,
-            )
+        # /webapp/versions — all matching entries, newest first
+        elif resource == "versions":
+            entries = apply_filters(all_entries)
+            entries.sort(key=lambda e: parse_version_components(e.get("version", "")), reverse=True)
             json_response(self, 200, [webapp_entry_to_dict(e) for e in entries])
 
-        # /webapp/latest/<branch>
-        elif len(parts) == 2 and parts[0] == "latest":
-            branch = parts[1]
-            entries = [e for e in webapp if e.get("branch") == branch]
-            if firmware_version:
-                entries = [
-                    e for e in entries
-                    if not e.get("min_firmware") or version_ge(firmware_version, e["min_firmware"])
-                ]
+        # /webapp/latest — newest per branch when branch unspecified; single when specified
+        elif resource == "latest":
+            entries = apply_filters(all_entries)
             if not entries:
                 not_found(self, f"no compatible webapp for branch={branch} firmware_version={firmware_version}")
                 return
-            best = max(entries, key=lambda e: parse_version_components(e.get("version", "")))
-            json_response(self, 200, webapp_entry_to_dict(best))
+            if branch is not None:
+                best = max(entries, key=lambda e: parse_version_components(e.get("version", "")))
+                json_response(self, 200, webapp_entry_to_dict(best))
+            else:
+                groups: dict = {}
+                for e in entries:
+                    b = e.get("branch", "")
+                    if b not in groups or (
+                        parse_version_components(e.get("version", ""))
+                        > parse_version_components(groups[b].get("version", ""))
+                    ):
+                        groups[b] = e
+                result = sorted(groups.values(), key=lambda e: e.get("branch", ""))
+                json_response(self, 200, [webapp_entry_to_dict(e) for e in result])
 
         else:
             not_found(self)
