@@ -3,9 +3,6 @@
 # Called by CI after deploying new content, or manually after config edits.
 # Must be run as root (or with sudo) on the server.
 #
-# Required environment variables:
-#   DEPLOY_KNOCK_HASH  — needed only if fail2ban filters have changed
-#
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,6 +11,13 @@ DEPLOY_HOME="/home/${DEPLOY_USER}"
 
 echo "==> Pulling latest repo..."
 git -C "${REPO_DIR}" pull --ff-only
+
+# Load knock secret from env file if present (env var also accepted)
+ENV_FILE="${REPO_DIR}/knock-secret.env"
+if [[ -f "${ENV_FILE}" ]]; then
+    # shellcheck source=/dev/null
+    source "${ENV_FILE}"
+fi
 
 # ---------------------------------------------------------------------------
 # Redeploy fail2ban filters if DEPLOY_KNOCK_HASH is set

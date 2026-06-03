@@ -50,7 +50,7 @@ openssl rand -hex 32
 
 | Location | Form | Purpose |
 |----------|------|---------|
-| `DEPLOY_KNOCK_HASH` env var on the server | plaintext, set before running `setup.sh`/`update.sh` | Substituted into `/etc/fail2ban/filter.d/gh-knocker.conf` and `nginx-podlet-access.conf` at deploy time |
+| `knock-secret.env` in the repo root (gitignored) | `DEPLOY_KNOCK_HASH=<hash>` | Read automatically by `setup.sh` and `update.sh`; never committed |
 | GitHub Actions secret `DEPLOY_KNOCK_URL` in `esp_rgbww_firmware` | full URL `https://lightinator.de/deploy-knock-<hash>` | Used by the firmware CI deploy workflow to knock before SSH |
 | GitHub Actions secret `DEPLOY_KNOCK_URL` in `esp_rgb_webapp2` | full URL `https://lightinator.de/deploy-knock-<hash>` | Used by the webapp CI deploy workflow to knock before SSH |
 
@@ -136,7 +136,11 @@ Clone the repo to the server and run the bootstrap script as root:
 git clone https://github.com/pjakobs/lightinator-server.git \
     /home/github-deploy/lightinator-server
 
-export DEPLOY_KNOCK_HASH=<64-char hex from server secret>
+# Create the gitignored secrets file:
+echo 'DEPLOY_KNOCK_HASH=<64-char hex from server secret>' \
+    > /home/github-deploy/lightinator-server/knock-secret.env
+chmod 600 /home/github-deploy/lightinator-server/knock-secret.env
+
 export CERTBOT_EMAIL=admin@lightinator.de   # optional
 bash /home/github-deploy/lightinator-server/deploy/setup.sh
 ```

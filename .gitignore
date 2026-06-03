@@ -3,6 +3,9 @@
 *.pyc
 __pycache__/
 
+# Server secret — never commit
+knock-secret.env
+
 # Editor
 .vscode/
 *.swp

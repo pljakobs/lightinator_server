@@ -18,9 +18,35 @@ DEPLOY_HOME="/home/${DEPLOY_USER}"
 DOMAIN="${DOMAIN:-lightinator.de}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"   # set to enable --email flag for certbot
 
-if [[ -z "${DEPLOY_KNOCK_HASH:-}" ]]; then
-    echo "ERROR: DEPLOY_KNOCK_HASH is not set." >&2
-    echo "       Generate one with:  openssl rand -hex 32" >&2
+# ---------------------------------------------------------------------------
+# Load port-knock secret (knock-secret.env is gitignored)
+# ---------------------------------------------------------------------------
+
+ENV_FILE="${REPO_DIR}/knock-secret.env"
+
+if [[ -f "${ENV_FILE}" ]]; then
+    # shellcheck source=/dev/null
+    source "${ENV_FILE}"
+    echo "==> Loaded knock secret from ${ENV_FILE}"
+elif [[ -z "${DEPLOY_KNOCK_HASH:-}" ]]; then
+    echo "" >&2
+    echo "ERROR: No knock secret found." >&2
+    echo "" >&2
+    echo "  ${ENV_FILE} does not exist and DEPLOY_KNOCK_HASH is not set." >&2
+    echo "" >&2
+    echo "  To create a new secret:" >&2
+    echo "    1. Generate a hash:" >&2
+    echo "         openssl rand -hex 32" >&2
+    echo "    2. Save it to the (gitignored) env file:" >&2
+    echo "         echo 'DEPLOY_KNOCK_HASH=<hash>' > ${ENV_FILE}" >&2
+    echo "         chmod 600 ${ENV_FILE}" >&2
+    echo "    3. Add the same value to GitHub Actions secrets in BOTH repos:" >&2
+    echo "         esp_rgbww_firmware  -> secret DEPLOY_KNOCK_URL" >&2
+    echo "         esp_rgb_webapp2     -> secret DEPLOY_KNOCK_URL" >&2
+    echo "       The secret value must be the full URL:" >&2
+    echo "         https://${DOMAIN}/deploy-knock-<hash>" >&2
+    echo "    4. Re-run this script." >&2
+    echo "" >&2
     exit 1
 fi
 
