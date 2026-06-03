@@ -133,7 +133,7 @@ ssh lightinator.de "cat >> /home/github-deploy/.ssh/authorized_keys" \
 Clone the repo to the server and run the bootstrap script as root:
 
 ```bash
-git clone https://github.com/pjakobs/lightinator-server.git \
+git clone https://github.com/pljakobs/lightinator_server.git \
     /home/github-deploy/lightinator-server
 
 # Create the gitignored secrets file:
@@ -160,7 +160,7 @@ sudo bash /home/github-deploy/lightinator-server/deploy/update.sh
 ## Version API
 
 `version_api.py` exposes a read-only JSON API backed by `version.json`.
-nginx proxies `/api/` to `http://127.0.0.1:8765/`.
+nginx proxies `/api/` to `http://host.containers.internal:8765/api/`.
 
 Key endpoints:
 ```
