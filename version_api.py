@@ -20,6 +20,10 @@ VERSION_JSON_PATH = os.environ.get(
     "VERSION_JSON_PATH",
     "/home/github-deploy/nginx/html/version.json",
 )
+DOWNLOAD_BASE_URL = os.environ.get(
+    "VERSION_DOWNLOAD_BASE_URL",
+    "http://lightinator.de",
+)
 LISTEN_HOST = os.environ.get("VERSION_API_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VERSION_API_PORT", "8765"))
 CACHE_TTL = 10  # seconds
@@ -115,12 +119,24 @@ def firmware_entry_to_dict(entry: dict) -> dict:
 
 
 def webapp_entry_to_dict(entry: dict) -> dict:
+    branch = entry.get("branch", "")
+    version = entry.get("version", "")
+    build_type = entry.get("type", "debug")
+    basepath = f"{DOWNLOAD_BASE_URL}/download/webui/{branch}/{version}/"
+    files_with_names = [
+        {
+            "filename": f.get("path", ""),
+            "md5": f.get("md5", ""),
+        }
+        for f in entry.get("files", [])
+    ]
     return {
-        "version": entry.get("version", ""),
-        "branch": entry.get("branch", ""),
-        "type": entry.get("type", "debug"),
+        "version": version,
+        "branch": branch,
+        "type": build_type,
+        "basepath": basepath,
         "min_firmware": entry.get("min_firmware", ""),
-        "files": entry.get("files", []),
+        "files": files_with_names,
         "comment": entry.get("comment", ""),
     }
 
