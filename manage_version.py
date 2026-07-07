@@ -7,6 +7,11 @@ import base64
 import requests
 from urllib.parse import urlparse
 
+# Note: webapp bundle sizes are derived by version_api.py (per-file "size" and a
+# top-level "total_size"), preferring an explicit "size" in version.json and
+# falling back to stat'ing the deployed file. Storing sizes here at add-webapp
+# time remains an optional future optimisation.
+
 def update_latest_symlink(data, base_dir='download/firmware'):
     """
     For each branch (develop, testing, main), create or update a symlink (or copy) in download/latest-<branch>/app_merged.bin

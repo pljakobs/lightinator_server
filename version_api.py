@@ -24,6 +24,12 @@ DOWNLOAD_BASE_URL = os.environ.get(
     "VERSION_DOWNLOAD_BASE_URL",
     "http://lightinator.de",
 )
+# Local filesystem root that nginx serves (siblings of version.json). Used to
+# stat webapp bundle files when version.json doesn't carry explicit sizes.
+HTML_ROOT = os.environ.get(
+    "VERSION_HTML_ROOT",
+    os.path.dirname(VERSION_JSON_PATH),
+)
 LISTEN_HOST = os.environ.get("VERSION_API_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VERSION_API_PORT", "8765"))
 CACHE_TTL = 10  # seconds
@@ -123,19 +129,42 @@ def webapp_entry_to_dict(entry: dict) -> dict:
     version = entry.get("version", "")
     build_type = entry.get("type", "debug")
     basepath = f"{DOWNLOAD_BASE_URL}/download/webui/{branch}/{version}/"
-    files_with_names = [
-        {
+
+    def file_size(f: dict) -> int:
+        # Prefer an explicit size from version.json; fall back to stat'ing the
+        # deployed file on disk so firmware gets sizes even for older entries.
+        stored = f.get("size")
+        if stored:
+            try:
+                return int(stored)
+            except (TypeError, ValueError):
+                pass
+        name = f.get("path", "")
+        if not name:
+            return 0
+        local = os.path.join(HTML_ROOT, "download", "webui", branch, version, name)
+        try:
+            return os.path.getsize(local)
+        except OSError:
+            return 0
+
+    files_with_names = []
+    total_size = 0
+    for f in entry.get("files", []):
+        size = file_size(f)
+        total_size += size
+        files_with_names.append({
             "filename": f.get("path", ""),
             "md5": f.get("md5", ""),
-        }
-        for f in entry.get("files", [])
-    ]
+            "size": size,
+        })
     return {
         "version": version,
         "branch": branch,
         "type": build_type,
         "basepath": basepath,
         "min_firmware": entry.get("min_firmware", ""),
+        "total_size": total_size,
         "files": files_with_names,
         "comment": entry.get("comment", ""),
     }
