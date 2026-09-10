@@ -12,9 +12,12 @@ firewall, so it is only reachable from the container network.
 import json
 import os
 import time
-import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from typing import Any
+from pydantic import Field
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 VERSION_JSON_PATH = os.environ.get(
     "VERSION_JSON_PATH",
@@ -95,25 +98,33 @@ def load_version_json() -> dict:
         return _cache["data"] or {}
 
 
-# ---------------------------------------------------------------------------
-# Route helpers
-# ---------------------------------------------------------------------------
-
-def json_response(handler, status: int, body) -> None:
-    payload = json.dumps(body, indent=2).encode()
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(payload)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
-    handler.wfile.write(payload)
+class FirmwareEntry(BaseModel):
+    version: str = ""
+    soc: str = ""
+    branch: str = ""
+    type: str = ""
+    url: str = ""
+    comment: str = ""
 
 
-def not_found(handler, msg="not found") -> None:
-    json_response(handler, 404, {"error": msg})
+class WebappFile(BaseModel):
+    filename: str = ""
+    md5: str = ""
+    size: int = Field(default=0, ge=0)
 
 
-def firmware_entry_to_dict(entry: dict) -> dict:
+class WebappEntry(BaseModel):
+    version: str = ""
+    branch: str = ""
+    type: str = "debug"
+    basepath: str = ""
+    min_firmware: str = ""
+    total_size: int = Field(default=0, ge=0)
+    files: list[WebappFile] = Field(default_factory=list)
+    comment: str = ""
+
+
+def firmware_entry_to_model(entry: dict) -> FirmwareEntry:
     return {
         "version": entry.get("fw_version", entry.get("version", "")),
         "soc": entry.get("soc", ""),
@@ -124,7 +135,7 @@ def firmware_entry_to_dict(entry: dict) -> dict:
     }
 
 
-def webapp_entry_to_dict(entry: dict) -> dict:
+def webapp_entry_to_model(entry: dict) -> WebappEntry:
     branch = entry.get("branch", "")
     version = entry.get("version", "")
     build_type = entry.get("type", "debug")
@@ -148,224 +159,127 @@ def webapp_entry_to_dict(entry: dict) -> dict:
         except OSError:
             return 0
 
-    files_with_names = []
+    files_with_names: list[WebappFile] = []
     total_size = 0
     for f in entry.get("files", []):
         size = file_size(f)
         total_size += size
-        files_with_names.append({
-            "filename": f.get("path", ""),
-            "md5": f.get("md5", ""),
-            "size": size,
-        })
-    return {
-        "version": version,
-        "branch": branch,
-        "type": build_type,
-        "basepath": basepath,
-        "min_firmware": entry.get("min_firmware", ""),
-        "total_size": total_size,
-        "files": files_with_names,
-        "comment": entry.get("comment", ""),
-    }
+        files_with_names.append(WebappFile(
+            filename=f.get("path", ""),
+            md5=f.get("md5", ""),
+            size=size,
+        ))
+    return WebappEntry(
+        version=version,
+        branch=branch,
+        type=build_type,
+        basepath=basepath,
+        min_firmware=entry.get("min_firmware", ""),
+        total_size=total_size,
+        files=files_with_names,
+        comment=entry.get("comment", ""),
+    )
 
 
-# ---------------------------------------------------------------------------
-# Request handler
-# ---------------------------------------------------------------------------
-
-class VersionAPIHandler(BaseHTTPRequestHandler):
-
-    def log_message(self, fmt, *args):  # suppress default access log noise
-        pass
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        # Strip leading /api/ prefix that nginx may or may not strip
-        path = parsed.path
-        if path.startswith("/api/"):
-            path = path[4:]  # leave leading /
-        qs = parse_qs(parsed.query)
-
-        # Split into segments, drop empty strings
-        parts = [p for p in path.split("/") if p]
-
-        data = load_version_json()
-        if not data:
-            json_response(self, 503, {"error": "version.json unavailable"})
-            return
-
-        # Route: firmware
-        if parts and parts[0] == "firmware":
-            self._handle_firmware(parts[1:], qs, data)
-        elif parts and parts[0] == "webapp":
-            self._handle_webapp(parts[1:], qs, data)
-        else:
-            not_found(self)
-
-    # ------------------------------------------------------------------
-    # Firmware routes
-    #
-    # All filter axes are optional query parameters:
-    #   ?soc=<soc>  &branch=<branch>  &type=<type>
-    #
-    # Endpoints:
-    #   GET /api/firmware/socs
-    #   GET /api/firmware/branches[?soc=][&type=]
-    #   GET /api/firmware/types[?soc=][&branch=]
-    #   GET /api/firmware/versions[?soc=][&branch=][&type=]
-    #   GET /api/firmware/latest[?soc=][&branch=][&type=]
-    # ------------------------------------------------------------------
-
-    def _handle_firmware(self, parts, qs, data):
-        all_entries = data.get("firmware", []) + data.get("history", [])
-
-        soc    = (qs.get("soc")    or [None])[0]
-        branch = (qs.get("branch") or [None])[0]
-        ftype  = (qs.get("type")   or [None])[0]
-
-        def fw_ver(e):
-            return e.get("fw_version", e.get("version", ""))
-
-        def apply_filters(entries):
-            return [
-                e for e in entries
-                if (soc    is None or e.get("soc",    "").lower() == soc.lower())
-                and (branch is None or e.get("branch", "")         == branch)
-                and (ftype  is None or e.get("type",   "")         == ftype)
-            ]
-
-        if not parts:
-            not_found(self)
-            return
-
-        resource = parts[0]
-
-        # /firmware/socs — list distinct SOC values (filters: branch, type)
-        if resource == "socs":
-            entries = apply_filters(all_entries)
-            socs = sorted({e.get("soc", "") for e in entries if e.get("soc")})
-            json_response(self, 200, socs)
-
-        # /firmware/branches — list distinct branch values (filters: soc, type)
-        elif resource == "branches":
-            entries = apply_filters(all_entries)
-            branches = sorted({e.get("branch", "") for e in entries if e.get("branch")})
-            json_response(self, 200, branches)
-
-        # /firmware/types — list distinct type values (filters: soc, branch)
-        elif resource == "types":
-            entries = apply_filters(all_entries)
-            types = sorted({e.get("type", "") for e in entries if e.get("type")})
-            json_response(self, 200, types)
-
-        # /firmware/versions — all matching entries, newest first
-        elif resource == "versions":
-            entries = apply_filters(all_entries)
-            entries.sort(key=lambda e: parse_version_components(fw_ver(e)), reverse=True)
-            json_response(self, 200, [firmware_entry_to_dict(e) for e in entries])
-
-        # /firmware/latest — newest entry per unique (soc, branch, type) slice
-        elif resource == "latest":
-            entries = apply_filters(all_entries)
-            if not entries:
-                not_found(self, f"no firmware matching soc={soc} branch={branch} type={ftype}")
-                return
-            # When all three axes are fixed, return a single object.
-            # Otherwise return one latest entry per unique remaining combination.
-            if soc is not None and branch is not None and ftype is not None:
-                best = max(entries, key=lambda e: parse_version_components(fw_ver(e)))
-                json_response(self, 200, firmware_entry_to_dict(best))
-            else:
-                groups: dict = {}
-                for e in entries:
-                    key = (e.get("soc", ""), e.get("branch", ""), e.get("type", ""))
-                    if key not in groups or (
-                        parse_version_components(fw_ver(e))
-                        > parse_version_components(fw_ver(groups[key]))
-                    ):
-                        groups[key] = e
-                result = sorted(groups.values(), key=lambda e: (e.get("soc", ""), e.get("branch", ""), e.get("type", "")))
-                json_response(self, 200, [firmware_entry_to_dict(e) for e in result])
-
-        else:
-            not_found(self)
-
-    # ------------------------------------------------------------------
-    # Webapp routes
-    #
-    # Filter axes are optional query parameters:
-    #   ?branch=<branch>  &firmware_version=<ver>
-    #
-    # Endpoints:
-    #   GET /api/webapp/branches
-    #   GET /api/webapp/versions[?branch=][&firmware_version=]
-    #   GET /api/webapp/latest[?branch=][&firmware_version=]
-    # ------------------------------------------------------------------
-
-    def _handle_webapp(self, parts, qs, data):
-        all_entries = data.get("webapp", []) + data.get("webapp_history", [])
-
-        branch           = (qs.get("branch")           or [None])[0]
-        firmware_version = (qs.get("firmware_version") or [None])[0]
-
-        def apply_filters(entries):
-            filtered = [e for e in entries if branch is None or e.get("branch") == branch]
-            if firmware_version:
-                filtered = [
-                    e for e in filtered
-                    if not e.get("min_firmware") or version_ge(firmware_version, e["min_firmware"])
-                ]
-            return filtered
-
-        if not parts:
-            not_found(self)
-            return
-
-        resource = parts[0]
-
-        # /webapp/branches
-        if resource == "branches":
-            branches = sorted({e.get("branch", "") for e in all_entries if e.get("branch")})
-            json_response(self, 200, branches)
-
-        # /webapp/versions — all matching entries, newest first
-        elif resource == "versions":
-            entries = apply_filters(all_entries)
-            entries.sort(key=lambda e: parse_version_components(e.get("version", "")), reverse=True)
-            json_response(self, 200, [webapp_entry_to_dict(e) for e in entries])
-
-        # /webapp/latest — newest per branch when branch unspecified; single when specified
-        elif resource == "latest":
-            entries = apply_filters(all_entries)
-            if not entries:
-                not_found(self, f"no compatible webapp for branch={branch} firmware_version={firmware_version}")
-                return
-            if branch is not None:
-                best = max(entries, key=lambda e: parse_version_components(e.get("version", "")))
-                json_response(self, 200, webapp_entry_to_dict(best))
-            else:
-                groups: dict = {}
-                for e in entries:
-                    b = e.get("branch", "")
-                    if b not in groups or (
-                        parse_version_components(e.get("version", ""))
-                        > parse_version_components(groups[b].get("version", ""))
-                    ):
-                        groups[b] = e
-                result = sorted(groups.values(), key=lambda e: e.get("branch", ""))
-                json_response(self, 200, [webapp_entry_to_dict(e) for e in result])
-
-        else:
-            not_found(self)
+app = FastAPI(
+    title="Lightinator Version API",
+    description="Read-only firmware and webapp catalogue backed by version.json.",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def version_data() -> dict:
+    data = load_version_json()
+    if not data:
+        raise HTTPException(status_code=503, detail="version.json unavailable")
+    return data
 
-if __name__ == "__main__":
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), VersionAPIHandler)
-    print(f"Version API listening on {LISTEN_HOST}:{LISTEN_PORT}")
-    print(f"version.json: {VERSION_JSON_PATH}")
-    server.serve_forever()
+
+def firmware_entries(data: dict, soc: str | None, branch: str | None, ftype: str | None) -> list[dict]:
+    entries = data.get("firmware", []) + data.get("history", [])
+    return [e for e in entries if
+            (soc is None or e.get("soc", "").lower() == soc.lower()) and
+            (branch is None or e.get("branch", "") == branch) and
+            (ftype is None or e.get("type", "") == ftype)]
+
+
+def webapp_entries(data: dict, branch: str | None, firmware_version: str | None) -> list[dict]:
+    entries = data.get("webapp", []) + data.get("webapp_history", [])
+    result = [e for e in entries if branch is None or e.get("branch") == branch]
+    if firmware_version:
+        result = [e for e in result if not e.get("min_firmware") or
+                  version_ge(firmware_version, e["min_firmware"])]
+    return result
+
+
+@app.get("/api/firmware/socs", response_model=list[str], tags=["firmware"])
+def firmware_socs(branch: str | None = None, type: str | None = None):
+    return sorted({e.get("soc", "") for e in firmware_entries(version_data(), None, branch, type) if e.get("soc")})
+
+
+@app.get("/api/firmware/branches", response_model=list[str], tags=["firmware"])
+def firmware_branches(soc: str | None = None, type: str | None = None):
+    return sorted({e.get("branch", "") for e in firmware_entries(version_data(), soc, None, type) if e.get("branch")})
+
+
+@app.get("/api/firmware/types", response_model=list[str], tags=["firmware"])
+def firmware_types(soc: str | None = None, branch: str | None = None):
+    return sorted({e.get("type", "") for e in firmware_entries(version_data(), soc, branch, None) if e.get("type")})
+
+
+@app.get("/api/firmware/versions", response_model=list[FirmwareEntry], tags=["firmware"])
+def firmware_versions(soc: str | None = None, branch: str | None = None, type: str | None = None):
+    entries = firmware_entries(version_data(), soc, branch, type)
+    entries.sort(key=lambda e: parse_version_components(e.get("fw_version", e.get("version", ""))), reverse=True)
+    return [firmware_entry_to_model(e) for e in entries]
+
+
+@app.get("/api/firmware/latest", response_model=FirmwareEntry | list[FirmwareEntry], tags=["firmware"])
+def firmware_latest(soc: str | None = None, branch: str | None = None, type: str | None = None):
+    entries = firmware_entries(version_data(), soc, branch, type)
+    if not entries:
+        raise HTTPException(404, f"no firmware matching soc={soc} branch={branch} type={type}")
+    if soc is not None and branch is not None and type is not None:
+        return firmware_entry_to_model(max(entries, key=lambda e: parse_version_components(e.get("fw_version", e.get("version", "")))))
+    groups: dict[tuple[str, str, str], dict] = {}
+    for entry in entries:
+        key = (entry.get("soc", ""), entry.get("branch", ""), entry.get("type", ""))
+        if key not in groups or parse_version_components(entry.get("fw_version", entry.get("version", ""))) > parse_version_components(groups[key].get("fw_version", groups[key].get("version", ""))):
+            groups[key] = entry
+    return [firmware_entry_to_model(e) for e in sorted(groups.values(), key=lambda e: (e.get("soc", ""), e.get("branch", ""), e.get("type", "")))]
+
+
+@app.get("/api/webapp/branches", response_model=list[str], tags=["webapp"])
+def webapp_branches():
+    return sorted({e.get("branch", "") for e in webapp_entries(version_data(), None, None) if e.get("branch")})
+
+
+@app.get("/api/webapp/versions", response_model=list[WebappEntry], tags=["webapp"])
+def webapp_versions(branch: str | None = None, firmware_version: str | None = None):
+    entries = webapp_entries(version_data(), branch, firmware_version)
+    entries.sort(key=lambda e: parse_version_components(e.get("version", "")), reverse=True)
+    return [webapp_entry_to_model(e) for e in entries]
+
+
+@app.get("/api/webapp/latest", response_model=WebappEntry | list[WebappEntry], tags=["webapp"])
+def webapp_latest(branch: str | None = None, firmware_version: str | None = None):
+    entries = webapp_entries(version_data(), branch, firmware_version)
+    if not entries:
+        raise HTTPException(404, f"no compatible webapp for branch={branch} firmware_version={firmware_version}")
+    if branch is not None:
+        return webapp_entry_to_model(max(entries, key=lambda e: parse_version_components(e.get("version", ""))))
+    groups: dict[str, dict] = {}
+    for entry in entries:
+        b = entry.get("branch", "")
+        if b not in groups or parse_version_components(entry.get("version", "")) > parse_version_components(groups[b].get("version", "")):
+            groups[b] = entry
+    return [webapp_entry_to_model(e) for e in sorted(groups.values(), key=lambda e: e.get("branch", ""))]

@@ -162,6 +162,14 @@ sudo bash /home/github-deploy/lightinator-server/deploy/update.sh
 `version_api.py` exposes a read-only JSON API backed by `version.json`.
 nginx proxies `/api/` to `http://host.containers.internal:8765/api/`.
 
+The API is served by FastAPI/Uvicorn and publishes generated documentation:
+
+```
+https://lightinator.de/api/docs
+https://lightinator.de/api/redoc
+https://lightinator.de/api/openapi.json
+```
+
 ### Concepts
 
 The firmware catalogue is an **n-cube** with three axes. Any combination of

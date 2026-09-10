@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 User=github-deploy
 WorkingDirectory=/home/github-deploy/lightinator-server
-ExecStart=/usr/bin/python3 /home/github-deploy/lightinator-server/version_api.py
+ExecStart=/home/github-deploy/lightinator-server/.venv/bin/uvicorn version_api:app --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=5
 

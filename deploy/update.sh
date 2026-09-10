@@ -58,6 +58,11 @@ echo "    nginx reloaded"
 # Restart version-api if source changed
 # ---------------------------------------------------------------------------
 
+echo "==> Updating version API Python environment..."
+runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
+    --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"
+echo "    Python dependencies updated"
+
 echo "==> Restarting version-api..."
 systemctl restart version-api.service
 echo "    version-api restarted"

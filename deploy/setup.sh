@@ -88,6 +88,15 @@ fi
 install -d -m 700 -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh"
 touch "${DEPLOY_HOME}/.ssh/authorized_keys"
 chmod 600 "${DEPLOY_HOME}/.ssh/authorized_keys"
+
+# FastAPI/Uvicorn runtime for the version API
+echo "==> Installing version API Python environment..."
+if [[ ! -x "${REPO_DIR}/.venv/bin/python" ]]; then
+    runuser -u "${DEPLOY_USER}" -- python3 -m venv "${REPO_DIR}/.venv"
+fi
+runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
+    --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"
+echo "    FastAPI/Uvicorn environment ready"
 chown "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh/authorized_keys"
 echo "    .ssh/authorized_keys ready (add deploy public keys manually)"
 
