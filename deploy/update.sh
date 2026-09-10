@@ -59,6 +59,9 @@ echo "    nginx reloaded"
 # ---------------------------------------------------------------------------
 
 echo "==> Updating version API Python environment..."
+if [[ ! -x "${REPO_DIR}/.venv/bin/python" ]]; then
+    runuser -u "${DEPLOY_USER}" -- python3 -m venv "${REPO_DIR}/.venv"
+fi
 runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
     --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"
 echo "    Python dependencies updated"
