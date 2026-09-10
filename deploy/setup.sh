@@ -182,6 +182,8 @@ install -m 644 "${REPO_DIR}/containers/nginx.container" \
 install -m 644 -o "${DEPLOY_USER}" -g nginx \
     "${REPO_DIR}/nginx/default.conf" \
     "${DEPLOY_HOME}/nginx/conf.d/default.conf"
+chcon --reference="${DEPLOY_HOME}/nginx/conf.d" \
+    "${DEPLOY_HOME}/nginx/conf.d/default.conf"
 echo "    installed default.conf"
 
 systemctl daemon-reload
@@ -232,6 +234,4 @@ echo "========================================"
 echo ""
 echo "Manual steps remaining:"
 echo "  1. Add deploy public keys to ${DEPLOY_HOME}/.ssh/authorized_keys"
-echo "  2. Add the /api/ proxy block to nginx/default.conf (see TODO in file)"
-echo "     then run:  bash ${REPO_DIR}/deploy/update.sh"
-echo "  3. Verify nginx:  curl -I https://${DOMAIN}/"
+echo "  2. Verify nginx:  curl -I https://${DOMAIN}/"
