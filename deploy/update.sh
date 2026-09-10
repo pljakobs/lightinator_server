@@ -65,6 +65,12 @@ runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
     --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"
 echo "    Python dependencies updated"
 
+echo "==> Installing version-api systemd unit..."
+install -m 644 "${REPO_DIR}/systemd/version-api.service" \
+    /etc/systemd/system/version-api.service
+systemctl daemon-reload
+echo "    systemd unit installed"
+
 echo "==> Restarting version-api..."
 systemctl restart version-api.service
 echo "    version-api restarted"
