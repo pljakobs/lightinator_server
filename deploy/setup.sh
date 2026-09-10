@@ -60,6 +60,8 @@ dnf install -y \
     fail2ban \
     certbot \
     python3 \
+    python3.11 \
+    python3.11-pip \
     firewalld \
     git
 echo "    done"
@@ -91,8 +93,15 @@ chmod 600 "${DEPLOY_HOME}/.ssh/authorized_keys"
 
 # FastAPI/Uvicorn runtime for the version API
 echo "==> Installing version API Python environment..."
-if [[ ! -x "${REPO_DIR}/.venv/bin/python" ]]; then
-    runuser -u "${DEPLOY_USER}" -- python3 -m venv "${REPO_DIR}/.venv"
+API_PYTHON="${API_PYTHON:-$(command -v python3.11 || command -v python3)}"
+API_PYTHON_VERSION="$(${API_PYTHON} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+VENV_PYTHON_VERSION=""
+if [[ -x "${REPO_DIR}/.venv/bin/python" ]]; then
+    VENV_PYTHON_VERSION="$(${REPO_DIR}/.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+fi
+if [[ "${VENV_PYTHON_VERSION}" != "${API_PYTHON_VERSION}" ]]; then
+    rm -rf "${REPO_DIR}/.venv"
+    runuser -u "${DEPLOY_USER}" -- "${API_PYTHON}" -m venv "${REPO_DIR}/.venv"
 fi
 runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
     --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"

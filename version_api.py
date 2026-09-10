@@ -14,7 +14,7 @@ firewall, so it is only reachable from the container network.
 import json
 import os
 import time
-from typing import Any
+from typing import Any, List, Optional, Union
 from pydantic import Field
 
 from fastapi import FastAPI, HTTPException, Query
@@ -206,7 +206,7 @@ def version_data() -> dict:
     return data
 
 
-def firmware_entries(data: dict, soc: str | None, branch: str | None, ftype: str | None) -> list[dict]:
+def firmware_entries(data: dict, soc: Optional[str], branch: Optional[str], ftype: Optional[str]) -> List[dict]:
     entries = data.get("firmware", []) + data.get("history", [])
     return [e for e in entries if
             (soc is None or e.get("soc", "").lower() == soc.lower()) and
@@ -214,7 +214,7 @@ def firmware_entries(data: dict, soc: str | None, branch: str | None, ftype: str
             (ftype is None or e.get("type", "") == ftype)]
 
 
-def webapp_entries(data: dict, branch: str | None, firmware_version: str | None) -> list[dict]:
+def webapp_entries(data: dict, branch: Optional[str], firmware_version: Optional[str]) -> List[dict]:
     entries = data.get("webapp", []) + data.get("webapp_history", [])
     result = [e for e in entries if branch is None or e.get("branch") == branch]
     if firmware_version:
@@ -224,29 +224,29 @@ def webapp_entries(data: dict, branch: str | None, firmware_version: str | None)
 
 
 @app.get("/api/firmware/socs", response_model=list[str], tags=["firmware"])
-def firmware_socs(branch: str | None = None, type: str | None = None):
+def firmware_socs(branch: Optional[str] = None, type: Optional[str] = None):
     return sorted({e.get("soc", "") for e in firmware_entries(version_data(), None, branch, type) if e.get("soc")})
 
 
 @app.get("/api/firmware/branches", response_model=list[str], tags=["firmware"])
-def firmware_branches(soc: str | None = None, type: str | None = None):
+def firmware_branches(soc: Optional[str] = None, type: Optional[str] = None):
     return sorted({e.get("branch", "") for e in firmware_entries(version_data(), soc, None, type) if e.get("branch")})
 
 
 @app.get("/api/firmware/types", response_model=list[str], tags=["firmware"])
-def firmware_types(soc: str | None = None, branch: str | None = None):
+def firmware_types(soc: Optional[str] = None, branch: Optional[str] = None):
     return sorted({e.get("type", "") for e in firmware_entries(version_data(), soc, branch, None) if e.get("type")})
 
 
 @app.get("/api/firmware/versions", response_model=list[FirmwareEntry], tags=["firmware"])
-def firmware_versions(soc: str | None = None, branch: str | None = None, type: str | None = None):
+def firmware_versions(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
     entries = firmware_entries(version_data(), soc, branch, type)
     entries.sort(key=lambda e: parse_version_components(e.get("fw_version", e.get("version", ""))), reverse=True)
     return [firmware_entry_to_model(e) for e in entries]
 
 
-@app.get("/api/firmware/latest", response_model=FirmwareEntry | list[FirmwareEntry], tags=["firmware"])
-def firmware_latest(soc: str | None = None, branch: str | None = None, type: str | None = None):
+@app.get("/api/firmware/latest", response_model=Union[FirmwareEntry, List[FirmwareEntry]], tags=["firmware"])
+def firmware_latest(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
     entries = firmware_entries(version_data(), soc, branch, type)
     if not entries:
         raise HTTPException(404, f"no firmware matching soc={soc} branch={branch} type={type}")
@@ -266,14 +266,14 @@ def webapp_branches():
 
 
 @app.get("/api/webapp/versions", response_model=list[WebappEntry], tags=["webapp"])
-def webapp_versions(branch: str | None = None, firmware_version: str | None = None):
+def webapp_versions(branch: Optional[str] = None, firmware_version: Optional[str] = None):
     entries = webapp_entries(version_data(), branch, firmware_version)
     entries.sort(key=lambda e: parse_version_components(e.get("version", "")), reverse=True)
     return [webapp_entry_to_model(e) for e in entries]
 
 
-@app.get("/api/webapp/latest", response_model=WebappEntry | list[WebappEntry], tags=["webapp"])
-def webapp_latest(branch: str | None = None, firmware_version: str | None = None):
+@app.get("/api/webapp/latest", response_model=Union[WebappEntry, List[WebappEntry]], tags=["webapp"])
+def webapp_latest(branch: Optional[str] = None, firmware_version: Optional[str] = None):
     entries = webapp_entries(version_data(), branch, firmware_version)
     if not entries:
         raise HTTPException(404, f"no compatible webapp for branch={branch} firmware_version={firmware_version}")
