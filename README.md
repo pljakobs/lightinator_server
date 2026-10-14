@@ -1,6 +1,8 @@
+
+<img align="left" width="96" height="96" src="images/lightinator-distribution-server-icon-dark.svg" alt="Lightinator Distribution Server icon">
+
 # lightinator-server
 
-<img align="right" width="96" height="96" src="images/lightinator-distribution-server-icon-dark.svg" alt="Lightinator Distribution Server icon">
 
 Server-side configuration and tooling for [lightinator.de](https://lightinator.de).
 
