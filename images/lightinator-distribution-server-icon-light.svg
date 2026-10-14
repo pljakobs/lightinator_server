@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Lightinator Distribution Server - Light</title>
+  <rect x="4" y="4" width="248" height="248" rx="38" fill="#f3f7f6"/>
+  <circle cx="128" cy="128" r="104" fill="none" stroke="#72c4bd" stroke-width="5" stroke-dasharray="13 11"/>
+  <g stroke="#319c9d" stroke-width="5">
+    <rect x="77" y="68" width="102" height="39" rx="8" fill="#9bdad5"/>
+    <rect x="77" y="109" width="102" height="39" rx="8" fill="#67c3c1"/>
+    <rect x="77" y="150" width="102" height="39" rx="8" fill="#3c9eb2"/>
+  </g>
+  <g fill="#246d84">
+    <circle cx="94" cy="87" r="4"/><circle cx="107" cy="87" r="4"/><circle cx="94" cy="128" r="4"/>
+    <circle cx="107" cy="128" r="4"/><circle cx="94" cy="169" r="4"/><circle cx="107" cy="169" r="4"/>
+  </g>
+  <g fill="none" stroke="#42b5ad" stroke-width="8" stroke-linecap="round">
+    <path d="M128 128 128 31"/><path d="M128 128 213 78"/><path d="M128 128 213 178"/>
+    <path d="M128 128 128 225"/><path d="M128 128 43 178"/><path d="M128 128 43 78"/>
+  </g>
+  <g stroke="#f3f7f6" stroke-width="3">
+    <circle cx="128" cy="31" r="14" fill="#2878c6"/><circle cx="213" cy="78" r="14" fill="#3295df"/>
+    <circle cx="213" cy="178" r="14" fill="#13b3c3"/><circle cx="128" cy="225" r="14" fill="#5bc7bb"/>
+    <circle cx="43" cy="178" r="14" fill="#13a783"/><circle cx="43" cy="78" r="14" fill="#f3c44f"/>
+  </g>
+  <circle cx="128" cy="126" r="24" fill="#ffffff" stroke="#42b5ad" stroke-width="7"/>
+  <path d="M128 111v31m-12-12 12 12 12-12" fill="none" stroke="#218f8d" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

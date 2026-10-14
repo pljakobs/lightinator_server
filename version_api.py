@@ -1,51 +1,182 @@
 #!/usr/bin/env python3
+"""
+Lightinator Release & Distribution Service
+Provides secure upload endpoints for CI deployment and read-only version discovery for clients.
+"""
+
 from __future__ import annotations
 
-"""
-lightinator.de Version API
-Read-only HTTP API over version.json for firmware and webapp version queries.
-
-Listens on 0.0.0.0:8765 (all interfaces on the host). nginx runs in a Podman
-container and cannot reach the host via 127.0.0.1; it connects via
-host.containers.internal:8765 instead. Port 8765 is not opened in the
-firewall, so it is only reachable from the container network.
-"""
-
-import json
 import os
-import time
-from typing import Any, List, Optional, Union
-from pydantic import Field
+import sqlite3
+import tarfile
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, Query
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-VERSION_JSON_PATH = os.environ.get(
-    "VERSION_JSON_PATH",
-    "/home/github-deploy/nginx/html/version.json",
-)
-DOWNLOAD_BASE_URL = os.environ.get(
-    "VERSION_DOWNLOAD_BASE_URL",
-    "http://lightinator.de",
-)
-# Local filesystem root that nginx serves (siblings of version.json). Used to
-# stat webapp bundle files when version.json doesn't carry explicit sizes.
-HTML_ROOT = os.environ.get(
-    "VERSION_HTML_ROOT",
-    os.path.dirname(VERSION_JSON_PATH),
-)
-LISTEN_HOST = os.environ.get("VERSION_API_HOST", "0.0.0.0")
+# ---------------------------------------------------------------------------
+# Configuration & Environment
+# ---------------------------------------------------------------------------
+
+DB_PATH = os.getenv("VERSION_DB_PATH", "firmware.db")
+STATIC_ROOT = Path(os.getenv("VERSION_HTML_ROOT", "/var/www/downloads"))
+DOWNLOAD_BASE_URL = os.getenv("VERSION_DOWNLOAD_BASE_URL", "http://lightinator.de").rstrip("/")
+CI_TOKEN = os.getenv("CI_UPLOAD_TOKEN", "")
+PUBLIC_KEY_HEX = os.getenv("RELEASE_PUBLIC_KEY_HEX", "")
+
+LISTEN_HOST = os.getenv("VERSION_API_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VERSION_API_PORT", "8765"))
-CACHE_TTL = 10  # seconds
+OPENAPI_URL = "/api/openapi.json"
+DISTRIBUTION_ICON_URL = "/api/brand/lightinator-distribution-server-icon-dark.svg"
 
 
 # ---------------------------------------------------------------------------
-# Version comparison (mirrors parse_version_components in manage_version.py)
+# Database Helper & Initialization
 # ---------------------------------------------------------------------------
 
-def parse_version_components(version_string: str) -> tuple:
-    """Parse firmware version string into a sortable 4-tuple."""
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS firmware_builds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                soc TEXT NOT NULL,
+                type TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                version TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                url TEXT NOT NULL,
+                comment TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(soc, branch, type, version)
+            );
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS webapp_builds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                branch TEXT NOT NULL,
+                version TEXT NOT NULL,
+                type TEXT DEFAULT 'debug',
+                min_firmware TEXT,
+                file_path TEXT NOT NULL,
+                basepath TEXT NOT NULL,
+                comment TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(branch, version)
+            );
+            """
+        )
+        conn.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="Lightinator Firmware & Webapp Distribution API",
+    version="2.0.0",
+    lifespan=lifespan,
+    docs_url=None,
+    openapi_url=OPENAPI_URL,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+app.mount(
+        "/api/brand",
+        StaticFiles(directory=Path(__file__).parent / "images"),
+        name="brand",
+)
+
+
+@app.get("/api/docs", include_in_schema=False)
+def distribution_api_docs() -> HTMLResponse:
+        response = get_swagger_ui_html(
+                openapi_url=OPENAPI_URL,
+                title=f"{app.title} - API Docs",
+                swagger_favicon_url=DISTRIBUTION_ICON_URL,
+        )
+        html = response.body.decode("utf-8")
+        html = html.replace(
+                "</head>",
+                """<style>
+                    #lightinator-docs-brand {
+                        align-items: center;
+                        background: #20242b;
+                        border-bottom: 1px solid #414850;
+                        color: #f3f7f6;
+                        display: flex;
+                        font: 600 16px system-ui, sans-serif;
+                        gap: 12px;
+                        padding: 10px 24px;
+                    }
+                    #lightinator-docs-brand img {
+                        display: block;
+                        height: 48px;
+                        width: 48px;
+                    }
+                </style></head>""",
+                1,
+        )
+        html = html.replace(
+                "<body>",
+                f'<body><header id="lightinator-docs-brand">'
+                f'<img src="{DISTRIBUTION_ICON_URL}" alt="" width="48" height="48">'
+                "<span>Lightinator Distribution Server</span></header>",
+                1,
+        )
+        return HTMLResponse(content=html, status_code=response.status_code)
+
+
+# ---------------------------------------------------------------------------
+# Security & Authentication
+# ---------------------------------------------------------------------------
+
+def verify_token(authorization: str = Header(...)) -> None:
+    token = authorization.replace("Bearer ", "").strip()
+    if not CI_TOKEN or token != CI_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
+
+
+def verify_sig(data: bytes, signature_hex: str) -> None:
+    if not PUBLIC_KEY_HEX:
+        raise HTTPException(status_code=500, detail="Server public key is unconfigured")
+    try:
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(PUBLIC_KEY_HEX))
+        public_key.verify(bytes.fromhex(signature_hex), data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Cryptographic signature verification failed")
+
+
+# ---------------------------------------------------------------------------
+# Version Parsing Helper
+# ---------------------------------------------------------------------------
+
+def parse_version_components(version_string: str) -> tuple[int, int, int, int]:
     normalized = version_string.strip().lstrip("Vv")
     if not normalized:
         return (0, 0, 0, 0)
@@ -63,225 +194,247 @@ def parse_version_components(version_string: str) -> tuple:
     return (major, minor, patch, prerelease)
 
 
-def version_ge(a: str, b: str) -> bool:
-    """Return True if version a >= version b."""
-    return parse_version_components(a) >= parse_version_components(b)
-
-
 # ---------------------------------------------------------------------------
-# version.json cache
+# Pydantic Schemas
 # ---------------------------------------------------------------------------
-
-_cache: dict = {"data": None, "mtime": 0.0, "loaded_at": 0.0}
-
-
-def load_version_json() -> dict:
-    now = time.monotonic()
-    try:
-        mtime = os.path.getmtime(VERSION_JSON_PATH)
-    except OSError:
-        return {}
-
-    if (
-        _cache["data"] is not None
-        and mtime == _cache["mtime"]
-        and (now - _cache["loaded_at"]) < CACHE_TTL
-    ):
-        return _cache["data"]
-
-    try:
-        with open(VERSION_JSON_PATH) as f:
-            data = json.load(f)
-        _cache["data"] = data
-        _cache["mtime"] = mtime
-        _cache["loaded_at"] = now
-        return data
-    except (OSError, json.JSONDecodeError):
-        return _cache["data"] or {}
-
 
 class FirmwareEntry(BaseModel):
-    version: str = ""
-    soc: str = ""
-    branch: str = ""
-    type: str = ""
-    url: str = ""
+    version: str
+    soc: str
+    branch: str
+    type: str
+    url: str
     comment: str = ""
-
-
-class WebappFile(BaseModel):
-    filename: str = ""
-    md5: str = ""
-    size: int = Field(default=0, ge=0)
 
 
 class WebappEntry(BaseModel):
-    version: str = ""
-    branch: str = ""
+    version: str
+    branch: str
     type: str = "debug"
-    basepath: str = ""
+    basepath: str
     min_firmware: str = ""
-    total_size: int = Field(default=0, ge=0)
-    files: list[WebappFile] = Field(default_factory=list)
     comment: str = ""
 
 
-def firmware_entry_to_model(entry: dict) -> FirmwareEntry:
-    return {
-        "version": entry.get("fw_version", entry.get("version", "")),
-        "soc": entry.get("soc", ""),
-        "branch": entry.get("branch", ""),
-        "type": entry.get("type", ""),
-        "url": entry.get("files", {}).get("rom", {}).get("url", ""),
-        "comment": entry.get("comment", ""),
-    }
+# ---------------------------------------------------------------------------
+# CI Upload Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/firmware/upload", status_code=201, tags=["CI Upload"])
+async def upload_firmware(
+    soc: str = Form(...),
+    type: str = Form(...),
+    branch: str = Form(...),
+    version: str = Form(...),
+    signature: str = Form(...),
+    comment: str = Form(""),
+    file: UploadFile = File(...),
+    _: None = Depends(verify_token),
+):
+    payload = await file.read()
+    verify_sig(payload, signature)
+
+    target_dir = STATIC_ROOT / "firmware" / branch / version / soc / type
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = target_dir / file.filename
+    with open(file_path, "wb") as f:
+        f.write(payload)
+
+    rel_url = f"/downloads/firmware/{branch}/{version}/{soc}/{type}/{file.filename}"
+    full_url = f"{DOWNLOAD_BASE_URL}{rel_url}"
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO firmware_builds (soc, type, branch, version, file_path, url, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(soc, branch, type, version) DO UPDATE SET
+                file_path=excluded.file_path,
+                url=excluded.url,
+                comment=excluded.comment,
+                created_at=CURRENT_TIMESTAMP
+            """,
+            (soc.lower(), type.lower(), branch.lower(), version, str(file_path), full_url, comment),
+        )
+        conn.commit()
+
+    return {"status": "success", "url": full_url}
 
 
-def webapp_entry_to_model(entry: dict) -> WebappEntry:
-    branch = entry.get("branch", "")
-    version = entry.get("version", "")
-    build_type = entry.get("type", "debug")
-    basepath = f"{DOWNLOAD_BASE_URL}/download/webui/{branch}/{version}/"
+@app.post("/api/webapp/upload", status_code=201, tags=["CI Upload"])
+async def upload_webapp(
+    branch: str = Form(...),
+    version: str = Form(...),
+    type: str = Form("debug"),
+    min_firmware: str = Form(""),
+    signature: str = Form(...),
+    comment: str = Form(""),
+    archive: UploadFile = File(...),
+    _: None = Depends(verify_token),
+):
+    payload = await archive.read()
+    verify_sig(payload, signature)
 
-    def file_size(f: dict) -> int:
-        # Prefer an explicit size from version.json; fall back to stat'ing the
-        # deployed file on disk so firmware gets sizes even for older entries.
-        stored = f.get("size")
-        if stored:
-            try:
-                return int(stored)
-            except (TypeError, ValueError):
-                pass
-        name = f.get("path", "")
-        if not name:
-            return 0
-        local = os.path.join(HTML_ROOT, "download", "webui", branch, version, name)
-        try:
-            return os.path.getsize(local)
-        except OSError:
-            return 0
+    target_dir = STATIC_ROOT / "webapps" / branch / version
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    files_with_names: list[WebappFile] = []
-    total_size = 0
-    for f in entry.get("files", []):
-        size = file_size(f)
-        total_size += size
-        files_with_names.append(WebappFile(
-            filename=f.get("path", ""),
-            md5=f.get("md5", ""),
-            size=size,
-        ))
-    return WebappEntry(
-        version=version,
-        branch=branch,
-        type=build_type,
-        basepath=basepath,
-        min_firmware=entry.get("min_firmware", ""),
-        total_size=total_size,
-        files=files_with_names,
-        comment=entry.get("comment", ""),
-    )
+    archive_path = target_dir / archive.filename
+    with open(archive_path, "wb") as f:
+        f.write(payload)
 
+    if tarfile.is_tarfile(archive_path):
+        with tarfile.open(archive_path, "r:*") as tar:
+            tar.extractall(path=target_dir, filter="data")
+        archive_path.unlink()
+    else:
+        archive_path.unlink()
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid tar archive")
 
-app = FastAPI(
-    title="Lightinator Version API",
-    description="Read-only firmware and webapp catalogue backed by version.json.",
-    version="1.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-)
+    basepath = f"{DOWNLOAD_BASE_URL}/downloads/webapps/{branch}/{version}/"
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO webapp_builds (branch, version, type, min_firmware, file_path, basepath, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(branch, version) DO UPDATE SET
+                type=excluded.type,
+                min_firmware=excluded.min_firmware,
+                file_path=excluded.file_path,
+                basepath=excluded.basepath,
+                comment=excluded.comment,
+                created_at=CURRENT_TIMESTAMP
+            """,
+            (branch.lower(), version, type.lower(), min_firmware, str(target_dir), basepath, comment),
+        )
+        conn.commit()
+
+    return {"status": "success", "basepath": basepath}
 
 
-def version_data() -> dict:
-    data = load_version_json()
-    if not data:
-        raise HTTPException(status_code=503, detail="version.json unavailable")
-    return data
+# ---------------------------------------------------------------------------
+# Client Read API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/firmware/socs", response_model=List[str], tags=["Firmware Discovery"])
+def get_firmware_socs(branch: Optional[str] = None, type: Optional[str] = None):
+    query = "SELECT DISTINCT soc FROM firmware_builds WHERE 1=1"
+    params = []
+    if branch:
+        query += " AND branch = ?"
+        params.append(branch.lower())
+    if type:
+        query += " AND type = ?"
+        params.append(type.lower())
+
+    with get_db_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return sorted([row["soc"] for row in rows])
 
 
-def firmware_entries(data: dict, soc: Optional[str], branch: Optional[str], ftype: Optional[str]) -> List[dict]:
-    entries = data.get("firmware", []) + data.get("history", [])
-    return [e for e in entries if
-            (soc is None or e.get("soc", "").lower() == soc.lower()) and
-            (branch is None or e.get("branch", "") == branch) and
-            (ftype is None or e.get("type", "") == ftype)]
+@app.get("/api/firmware/branches", response_model=List[str], tags=["Firmware Discovery"])
+def get_firmware_branches(soc: Optional[str] = None, type: Optional[str] = None):
+    query = "SELECT DISTINCT branch FROM firmware_builds WHERE 1=1"
+    params = []
+    if soc:
+        query += " AND soc = ?"
+        params.append(soc.lower())
+    if type:
+        query += " AND type = ?"
+        params.append(type.lower())
+
+    with get_db_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return sorted([row["branch"] for row in rows])
 
 
-def webapp_entries(data: dict, branch: Optional[str], firmware_version: Optional[str]) -> List[dict]:
-    entries = data.get("webapp", []) + data.get("webapp_history", [])
-    result = [e for e in entries if branch is None or e.get("branch") == branch]
-    if firmware_version:
-        result = [e for e in result if not e.get("min_firmware") or
-                  version_ge(firmware_version, e["min_firmware"])]
-    return result
+@app.get("/api/firmware/types", response_model=List[str], tags=["Firmware Discovery"])
+def get_firmware_types(soc: Optional[str] = None, branch: Optional[str] = None):
+    query = "SELECT DISTINCT type FROM firmware_builds WHERE 1=1"
+    params = []
+    if soc:
+        query += " AND soc = ?"
+        params.append(soc.lower())
+    if branch:
+        query += " AND branch = ?"
+        params.append(branch.lower())
+
+    with get_db_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return sorted([row["type"] for row in rows])
 
 
-@app.get("/api/firmware/socs", response_model=list[str], tags=["firmware"])
-def firmware_socs(branch: Optional[str] = None, type: Optional[str] = None):
-    return sorted({e.get("soc", "") for e in firmware_entries(version_data(), None, branch, type) if e.get("soc")})
+@app.get("/api/firmware/versions", response_model=List[FirmwareEntry], tags=["Firmware Discovery"])
+def get_firmware_versions(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
+    query = "SELECT soc, type, branch, version, url, comment FROM firmware_builds WHERE 1=1"
+    params = []
+    if soc:
+        query += " AND soc = ?"
+        params.append(soc.lower())
+    if branch:
+        query += " AND branch = ?"
+        params.append(branch.lower())
+    if type:
+        query += " AND type = ?"
+        params.append(type.lower())
+
+    with get_db_connection() as conn:
+        rows = [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    rows.sort(key=lambda x: parse_version_components(x["version"]), reverse=True)
+    return [FirmwareEntry(**r) for r in rows]
 
 
-@app.get("/api/firmware/branches", response_model=list[str], tags=["firmware"])
-def firmware_branches(soc: Optional[str] = None, type: Optional[str] = None):
-    return sorted({e.get("branch", "") for e in firmware_entries(version_data(), soc, None, type) if e.get("branch")})
+@app.get("/api/firmware/latest", response_model=Union[FirmwareEntry, List[FirmwareEntry]], tags=["Firmware Discovery"])
+def get_latest_firmware(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
+    versions = get_firmware_versions(soc, branch, type)
+    if not versions:
+        raise HTTPException(status_code=404, detail="No firmware matching requested parameters")
 
+    if soc and branch and type:
+        return versions[0]
 
-@app.get("/api/firmware/types", response_model=list[str], tags=["firmware"])
-def firmware_types(soc: Optional[str] = None, branch: Optional[str] = None):
-    return sorted({e.get("type", "") for e in firmware_entries(version_data(), soc, branch, None) if e.get("type")})
-
-
-@app.get("/api/firmware/versions", response_model=list[FirmwareEntry], tags=["firmware"])
-def firmware_versions(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
-    entries = firmware_entries(version_data(), soc, branch, type)
-    entries.sort(key=lambda e: parse_version_components(e.get("fw_version", e.get("version", ""))), reverse=True)
-    return [firmware_entry_to_model(e) for e in entries]
-
-
-@app.get("/api/firmware/latest", response_model=Union[FirmwareEntry, List[FirmwareEntry]], tags=["firmware"])
-def firmware_latest(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
-    entries = firmware_entries(version_data(), soc, branch, type)
-    if not entries:
-        raise HTTPException(404, f"no firmware matching soc={soc} branch={branch} type={type}")
-    if soc is not None and branch is not None and type is not None:
-        return firmware_entry_to_model(max(entries, key=lambda e: parse_version_components(e.get("fw_version", e.get("version", "")))))
-    groups: dict[tuple[str, str, str], dict] = {}
-    for entry in entries:
-        key = (entry.get("soc", ""), entry.get("branch", ""), entry.get("type", ""))
-        if key not in groups or parse_version_components(entry.get("fw_version", entry.get("version", ""))) > parse_version_components(groups[key].get("fw_version", groups[key].get("version", ""))):
+    groups: dict[tuple[str, str, str], FirmwareEntry] = {}
+    for entry in versions:
+        key = (entry.soc, entry.branch, entry.type)
+        if key not in groups:
             groups[key] = entry
-    return [firmware_entry_to_model(e) for e in sorted(groups.values(), key=lambda e: (e.get("soc", ""), e.get("branch", ""), e.get("type", "")))]
+    return list(groups.values())
 
 
-@app.get("/api/webapp/branches", response_model=list[str], tags=["webapp"])
-def webapp_branches():
-    return sorted({e.get("branch", "") for e in webapp_entries(version_data(), None, None) if e.get("branch")})
+@app.get("/api/webapp/branches", response_model=List[str], tags=["Webapp Discovery"])
+def get_webapp_branches():
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT DISTINCT branch FROM webapp_builds").fetchall()
+    return sorted([row["branch"] for row in rows])
 
 
-@app.get("/api/webapp/versions", response_model=list[WebappEntry], tags=["webapp"])
-def webapp_versions(branch: Optional[str] = None, firmware_version: Optional[str] = None):
-    entries = webapp_entries(version_data(), branch, firmware_version)
-    entries.sort(key=lambda e: parse_version_components(e.get("version", "")), reverse=True)
-    return [webapp_entry_to_model(e) for e in entries]
+@app.get("/api/webapp/versions", response_model=List[WebappEntry], tags=["Webapp Discovery"])
+def get_webapp_versions(branch: Optional[str] = None, firmware_version: Optional[str] = None):
+    query = "SELECT branch, version, type, basepath, min_firmware, comment FROM webapp_builds WHERE 1=1"
+    params = []
+    if branch:
+        query += " AND branch = ?"
+        params.append(branch.lower())
+
+    with get_db_connection() as conn:
+        rows = [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    if firmware_version:
+        fw_comp = parse_version_components(firmware_version)
+        rows = [
+            r for r in rows
+            if not r["min_firmware"] or fw_comp >= parse_version_components(r["min_firmware"])
+        ]
+
+    rows.sort(key=lambda x: parse_version_components(x["version"]), reverse=True)
+    return [WebappEntry(**r) for r in rows]
 
 
-@app.get("/api/webapp/latest", response_model=Union[WebappEntry, List[WebappEntry]], tags=["webapp"])
-def webapp_latest(branch: Optional[str] = None, firmware_version: Optional[str] = None):
-    entries = webapp_entries(version_data(), branch, firmware_version)
-    if not entries:
-        raise HTTPException(404, f"no compatible webapp for branch={branch} firmware_version={firmware_version}")
-    if branch is not None:
-        return webapp_entry_to_model(max(entries, key=lambda e: parse_version_components(e.get("version", ""))))
-    groups: dict[str, dict] = {}
-    for entry in entries:
-        b = entry.get("branch", "")
-        if b not in groups or parse_version_components(entry.get("version", "")) > parse_version_components(groups[b].get("version", "")):
-            groups[b] = entry
-    return [webapp_entry_to_model(e) for e in sorted(groups.values(), key=lambda e: e.get("branch", ""))]
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("version_api:app", host=LISTEN_HOST, port=LISTEN_PORT, reload=False)
+

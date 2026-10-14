@@ -8,18 +8,16 @@
 #   export DEPLOY_KNOCK_HASH=<64-char hex>   # from the DEPLOY_KNOCK_HASH server secret
 #   bash /home/github-deploy/lightinator-server/deploy/setup.sh
 #
-# To generate a suitable hash:   openssl rand -hex 32
-#
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_USER="${DEPLOY_USER:-github-deploy}"
 DEPLOY_HOME="/home/${DEPLOY_USER}"
 DOMAIN="${DOMAIN:-lightinator.de}"
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"   # set to enable --email flag for certbot
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 
 # ---------------------------------------------------------------------------
-# Load port-knock secret (knock-secret.env is gitignored)
+# Load port-knock secret
 # ---------------------------------------------------------------------------
 
 ENV_FILE="${REPO_DIR}/knock-secret.env"
@@ -31,22 +29,6 @@ if [[ -f "${ENV_FILE}" ]]; then
 elif [[ -z "${DEPLOY_KNOCK_HASH:-}" ]]; then
     echo "" >&2
     echo "ERROR: No knock secret found." >&2
-    echo "" >&2
-    echo "  ${ENV_FILE} does not exist and DEPLOY_KNOCK_HASH is not set." >&2
-    echo "" >&2
-    echo "  To create a new secret:" >&2
-    echo "    1. Generate a hash:" >&2
-    echo "         openssl rand -hex 32" >&2
-    echo "    2. Save it to the (gitignored) env file:" >&2
-    echo "         echo 'DEPLOY_KNOCK_HASH=<hash>' > ${ENV_FILE}" >&2
-    echo "         chmod 600 ${ENV_FILE}" >&2
-    echo "    3. Add the same value to GitHub Actions secrets in BOTH repos:" >&2
-    echo "         esp_rgbww_firmware  -> secret DEPLOY_KNOCK_URL" >&2
-    echo "         esp_rgb_webapp2     -> secret DEPLOY_KNOCK_URL" >&2
-    echo "       The secret value must be the full URL:" >&2
-    echo "         https://${DOMAIN}/deploy-knock-<hash>" >&2
-    echo "    4. Re-run this script." >&2
-    echo "" >&2
     exit 1
 fi
 
@@ -81,36 +63,39 @@ if ! id "${DEPLOY_USER}" &>/dev/null; then
         --shell /bin/bash --groups nginx "${DEPLOY_USER}"
     echo "    created user ${DEPLOY_USER}"
 else
-    # Ensure user is in nginx group
     usermod -aG nginx "${DEPLOY_USER}" 2>/dev/null || true
     echo "    user ${DEPLOY_USER} already exists"
 fi
 
-# SSH directory for deploy keys (CI will populate authorized_keys)
 install -d -m 700 -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh"
 touch "${DEPLOY_HOME}/.ssh/authorized_keys"
 chmod 600 "${DEPLOY_HOME}/.ssh/authorized_keys"
+chown "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh/authorized_keys"
 
-# FastAPI/Uvicorn runtime for the version API
-echo "==> Installing version API Python environment..."
+# ---------------------------------------------------------------------------
+# 3. Python Environment & FastAPI Dependencies
+# ---------------------------------------------------------------------------
+
+echo "==> Setting up version API Python environment..."
 API_PYTHON="${API_PYTHON:-$(command -v python3.11 || command -v python3)}"
 API_PYTHON_VERSION="$(${API_PYTHON} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 VENV_PYTHON_VERSION=""
+
 if [[ -x "${REPO_DIR}/.venv/bin/python" ]]; then
     VENV_PYTHON_VERSION="$(${REPO_DIR}/.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
 fi
+
 if [[ "${VENV_PYTHON_VERSION}" != "${API_PYTHON_VERSION}" ]]; then
     rm -rf "${REPO_DIR}/.venv"
     runuser -u "${DEPLOY_USER}" -- "${API_PYTHON}" -m venv "${REPO_DIR}/.venv"
 fi
+
 runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
     --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"
 echo "    FastAPI/Uvicorn environment ready"
-chown "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh/authorized_keys"
-echo "    .ssh/authorized_keys ready (add deploy public keys manually)"
 
 # ---------------------------------------------------------------------------
-# 3. Firewall — ensure http/https open
+# 4. Firewall
 # ---------------------------------------------------------------------------
 
 echo "==> Configuring firewall..."
@@ -125,19 +110,17 @@ firewall-cmd --reload
 echo "    firewall configured"
 
 # ---------------------------------------------------------------------------
-# 4. Podman network (monitoring-stack)
+# 5. Podman network
 # ---------------------------------------------------------------------------
 
 echo "==> Creating Podman network..."
 if ! podman network exists monitoring-stack 2>/dev/null; then
     podman network create monitoring-stack
     echo "    created monitoring-stack network"
-else
-    echo "    monitoring-stack network already exists"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. TLS certificate via certbot
+# 6. TLS certificate via certbot
 # ---------------------------------------------------------------------------
 
 echo "==> Checking TLS certificate for ${DOMAIN}..."
@@ -149,31 +132,38 @@ if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
         certbot certonly --standalone --non-interactive --agree-tos \
             --register-unsafely-without-email -d "${DOMAIN}"
     fi
-    echo "    certificate issued"
-else
-    echo "    certificate already present"
 fi
-
-# Ensure certbot-renew.timer is enabled (ships with certbot package)
 systemctl enable --now certbot-renew.timer
-echo "    certbot-renew.timer enabled"
 
 # ---------------------------------------------------------------------------
-# 6. nginx directory layout + Quadlet
+# 7. Nginx directory layout & Database initialization
 # ---------------------------------------------------------------------------
 
-echo "==> Setting up nginx directories and Quadlet..."
+echo "==> Setting up storage directories and database..."
 install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/conf.d"
 install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html"
 install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/logs"
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/download"
+install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads"
+install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads/firmware"
+install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads/webapps"
 
-# Minimal version.json stub (CI will overwrite with real data)
-if [[ ! -f "${DEPLOY_HOME}/nginx/html/version.json" ]]; then
-    echo '{"firmware":[],"webapp":[],"history":[],"webapp_history":[]}' \
-        > "${DEPLOY_HOME}/nginx/html/version.json"
-    chown "${DEPLOY_USER}:nginx" "${DEPLOY_HOME}/nginx/html/version.json"
-    echo "    created stub version.json"
+# Migration trigger if legacy version.json is present
+LEGACY_JSON="${DEPLOY_HOME}/nginx/html/version.json"
+TARGET_DB="${REPO_DIR}/firmware.db"
+
+if [[ -f "${LEGACY_JSON}" ]]; then
+    echo "==> Migrating legacy version.json to SQLite database..."
+    runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/python" \
+        "${REPO_DIR}/migrate_to_sqlite.py" \
+        --source "${LEGACY_JSON}" \
+        --db "${TARGET_DB}"
+    LEGACY_BACKUP="${LEGACY_JSON}.bak"
+    if [[ -e "${LEGACY_BACKUP}" ]]; then
+        LEGACY_BACKUP="$(mktemp "${LEGACY_JSON}.bak.XXXXXX")"
+        rm "${LEGACY_BACKUP}"
+    fi
+    mv "${LEGACY_JSON}" "${LEGACY_BACKUP}"
+    echo "    Migration complete. Legacy file backed up to ${LEGACY_BACKUP}"
 fi
 
 install -m 644 "${REPO_DIR}/containers/nginx.container" \
@@ -184,14 +174,12 @@ install -m 644 -o "${DEPLOY_USER}" -g nginx \
     "${DEPLOY_HOME}/nginx/conf.d/default.conf"
 chcon --reference="${DEPLOY_HOME}/nginx/conf.d" \
     "${DEPLOY_HOME}/nginx/conf.d/default.conf"
-echo "    installed default.conf"
 
 systemctl daemon-reload
 systemctl enable --now nginx.service
-echo "    nginx enabled and started"
 
 # ---------------------------------------------------------------------------
-# 7. fail2ban filters, actions, jail config
+# 8. fail2ban filters & action scripts
 # ---------------------------------------------------------------------------
 
 echo "==> Installing fail2ban configs..."
@@ -201,7 +189,6 @@ for template in gh-knocker nginx-podlet-access; do
     src="${REPO_DIR}/fail2ban/filter.d/${template}.conf"
     dest="/etc/fail2ban/filter.d/${template}.conf"
     sed "s/%%DEPLOY_KNOCK_HASH%%/${DEPLOY_KNOCK_HASH}/g" "$src" > "$dest"
-    echo "    wrote ${dest}"
 done
 
 install -m 644 "${REPO_DIR}/fail2ban/action.d/f2b-whitelist.conf" \
@@ -211,10 +198,9 @@ install -m 644 "${REPO_DIR}/fail2ban/jail.d/lightinator.conf" \
 
 systemctl enable --now fail2ban
 systemctl reload fail2ban || systemctl restart fail2ban
-echo "    fail2ban configured"
 
 # ---------------------------------------------------------------------------
-# 8. version-api systemd service
+# 9. version-api systemd service installation
 # ---------------------------------------------------------------------------
 
 echo "==> Installing version-api service..."
@@ -223,15 +209,9 @@ install -m 644 "${REPO_DIR}/systemd/version-api.service" \
 
 systemctl daemon-reload
 systemctl enable --now version-api.service
-echo "    version-api enabled and started"
-
-# ---------------------------------------------------------------------------
+echo "    version-api service active"
 
 echo ""
 echo "========================================"
 echo "  Setup complete for ${DOMAIN}"
 echo "========================================"
-echo ""
-echo "Manual steps remaining:"
-echo "  1. Add deploy public keys to ${DEPLOY_HOME}/.ssh/authorized_keys"
-echo "  2. Verify nginx:  curl -I https://${DOMAIN}/"
