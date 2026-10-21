@@ -88,6 +88,13 @@ podman exec nginx nginx -t && podman exec nginx nginx -s reload
 # ---------------------------------------------------------------------------
 
 echo "==> Updating systemd service and restarting version-api..."
+install -d -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" -m 700 /var/lib/lightinator/ota-artifacts
+install -d -o root -g "${DEPLOY_USER}" -m 750 /etc/lightinator
+if [[ ! -f /etc/lightinator/version-api.env ]]; then
+    touch /etc/lightinator/version-api.env
+fi
+chown "root:${DEPLOY_USER}" /etc/lightinator/version-api.env
+chmod 640 /etc/lightinator/version-api.env
 install -m 644 "${REPO_DIR}/systemd/version-api.service" \
     /etc/systemd/system/version-api.service
 systemctl daemon-reload

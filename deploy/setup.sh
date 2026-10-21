@@ -146,6 +146,13 @@ install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/logs"
 install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads"
 install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads/firmware"
 install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads/webapps"
+install -d -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" -m 700 /var/lib/lightinator/ota-artifacts
+install -d -o root -g "${DEPLOY_USER}" -m 750 /etc/lightinator
+if [[ ! -f /etc/lightinator/version-api.env ]]; then
+    touch /etc/lightinator/version-api.env
+    chown "root:${DEPLOY_USER}" /etc/lightinator/version-api.env
+    chmod 640 /etc/lightinator/version-api.env
+fi
 
 # Migration trigger if legacy version.json is present
 LEGACY_JSON="${DEPLOY_HOME}/nginx/html/version.json"

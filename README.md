@@ -131,6 +131,12 @@ ssh lightinator.de "cat >> /home/github-deploy/.ssh/authorized_keys" \
 | `CERTBOT_EMAIL` | `setup.sh` | Optional; used for Let's Encrypt account registration |
 | `DEPLOY_USER` | `setup.sh`, `update.sh` | Defaults to `github-deploy` |
 | `DOMAIN` | `setup.sh` | Defaults to `lightinator.de` |
+| `CI_UPLOAD_TOKEN` | `version-api.env` | Bearer credential for legacy and product-aware CI uploads |
+| `OTA_ADMIN_TOKEN` | `version-api.env` | Separate bearer credential for registering products |
+| `OTA_PROMOTION_TOKEN` | `version-api.env` | Separate bearer credential for promoting published releases |
+| `RELEASE_PUBLIC_KEY_HEX` | `version-api.env` | 32-byte Ed25519 public key used to seed the controller product on first DB initialization |
+| `OTA_STORAGE_ROOT` | `version-api.env` | Private staging/published artifact storage; defaults to `/var/lib/lightinator/ota-artifacts` |
+| `VERSION_DB_PATH` | `version-api.env` | SQLite catalogue path; defaults to `firmware.db` in the server working directory |
 
 ## Initial setup
 
@@ -163,8 +169,9 @@ sudo bash /home/github-deploy/lightinator-server/deploy/update.sh
 
 ## Version API
 
-`version_api.py` exposes a read-only JSON API backed by `version.json`.
-nginx proxies `/api/` to `http://host.containers.internal:8765/api/`.
+`version_api.py` serves legacy discovery APIs from SQLite and exposes a separate
+product-aware OTA catalog, also stored in SQLite. nginx proxies `/api/` to
+`http://host.containers.internal:8765/api/`.
 
 The API is served by FastAPI/Uvicorn and publishes generated documentation:
 
@@ -173,6 +180,67 @@ https://lightinator.de/api/docs
 https://lightinator.de/api/redoc
 https://lightinator.de/api/openapi.json
 ```
+
+### Product-Aware OTA API
+
+The OTA catalog is additive; the existing `/api/firmware/*` and
+`/api/webapp/*` routes and SSH-based publisher remain unchanged. SQLite is the
+authority for the new catalog. These endpoints do not write `version.json`; a
+legacy projection can be generated from SQLite separately when needed.
+
+Only `controller` is registered by default. Its target policy allows ESP8266,
+ESP32 and ESP32-C3 for 5.0, and ESP32/ESP32-C3 for 5.1. New product IDs such as
+`wallpanel` or `color_sensor` must be explicitly registered by an administrator
+with a dedicated Ed25519 public key, source repository and version-line/SoC
+policy. No other product is currently enabled.
+
+CI creates a signed release manifest containing product, version, channel,
+source repository/commit, required changelog commit/subject entries, hardware
+targets and artifact roles, filenames, sizes and SHA-256 hashes. The Ed25519
+signature covers canonical JSON: sorted keys, compact separators and UTF-8
+encoding of the manifest with defaults included. The changelog is therefore
+covered by the same signature as the artifact metadata.
+
+Discovery responses include the canonical manifest, its SHA-256 digest, the
+Ed25519 signature, and the release public-key snapshot. OTA artifact URLs use
+HTTP by default to support ESP8266 clients. A device must compare the returned
+key with a public key pinned in firmware, verify the manifest signature and
+digest, and verify each downloaded artifact against the signed manifest before
+installation. A key delivered by this API over HTTP is not itself a trust
+anchor.
+
+Release flow:
+
+1. `POST /api/ota/releases` authenticates the CI bearer token, validates the
+    manifest against the registered product policy and verifies its signature.
+    It creates a staged release and returns one upload URL per artifact.
+2. `PUT /api/ota/releases/{release_id}/artifacts/{artifact_id}` streams raw
+    artifact bytes into private staging storage and verifies the declared size
+    and SHA-256. Individual artifacts are limited to 64 MiB and a release to
+    512 MiB.
+3. `POST /api/ota/releases/{release_id}/finalize` requires every declared
+    artifact, re-verifies hashes, atomically publishes the complete release and
+    adds it to its origin channel. Staged files are removed after publication.
+4. `POST /api/ota/releases/{release_id}/promote` uses the separate promotion
+    bearer token. Promotion is restricted to channels on the release's version
+    line; CI cannot publish directly to `prod`.
+5. `GET /api/ota/latest?product=controller&channel=5.0/develop&hardware=...&soc=esp8266&build_type=release`
+    returns the newest published matching target, including changelog and
+    artifact URLs. No compatible release returns 404.
+
+The product registry endpoint is `GET /api/ota/products`; registering a product
+uses `POST /api/ota/products` with the admin bearer token. Configure the
+credentials in `/etc/lightinator/version-api.env`, readable by the service user
+and not served by nginx. Required secrets are `CI_UPLOAD_TOKEN`,
+`OTA_ADMIN_TOKEN`, `OTA_PROMOTION_TOKEN`, and `RELEASE_PUBLIC_KEY_HEX` for the
+initial controller key. Set a dedicated `OTA_STORAGE_ROOT` if the default
+`/var/lib/lightinator/ota-artifacts` is unsuitable. The setup and update scripts
+create the private storage directory and an empty optional environment file;
+operators must provision the secrets before enabling API publishing.
+
+The server API implementation is not yet wired into firmware CI. Until that
+migration is completed, the existing SSH/rsync publisher and legacy catalogue
+remain the production path.
 
 ### Concepts
 
