@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Lightinator installer</title>
+    <meta name="viewport" content="width=device-width" />
+    <meta name="color-scheme" content="dark" />
+    <style>
+      :root {
+        --grafana-bg: #111217;
+        --grafana-surface: #181b1f;
+        --grafana-border: #2c3235;
+        --grafana-text: #d8d9da;
+        --grafana-orange: #f05a28;
+        --grafana-blue: #3274d9;
+      }
+
+      body {
+        font-family: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        background-color: var(--grafana-bg);
+        color: var(--grafana-text);
+        padding: 0;
+        margin: 0;
+        line-height: 1.6;
+      }
+
+      .content {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      h1, h2, h3 {
+        color: #fff;
+        font-weight: 500;
+      }
+
+      h1 { border-bottom: 1px solid var(--grafana-border); padding-bottom: 10px; }
+
+      a { color: var(--grafana-blue); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      pre {
+        background: var(--grafana-surface);
+        border: 1px solid var(--grafana-border);
+        padding: 12px;
+        border-radius: 4px;
+        color: #73bf69; /* Terminal green */
+        overflow-x: auto;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 20px 0;
+        background: var(--grafana-surface);
+      }
+
+      td {
+        padding: 12px;
+        border: 1px solid var(--grafana-border);
+      }
+
+      .radios {
+        padding: 0;
+        display: flex;
+        gap: 20px;
+      }
+
+      .radios li { list-style: none; }
+
+      /* Styling the ESP Install Button to look like a Grafana Action Button */
+      esp-web-install-button {
+        --esp-tools-button-border-radius: 2px;
+        --esp-tools-button-color: var(--grafana-orange);
+      }
+
+      .footer {
+        margin-top: 40px;
+        border-top: 1px solid var(--grafana-border);
+        padding: 20px;
+        font-size: 0.9em;
+        color: #7b7e83;
+      }
+
+      iframe {
+        border-top: 2px solid var(--grafana-border);
+        margin-top: 20px;
+        background: transparent;
+      }
+
+      .invisible { visibility: hidden; }
+    </style>
+    <script type="module" src="https://unpkg.com/esp-web-tools@8.0.1/dist/web/install-button.js?module"></script>
+  </head>
+  <body>
+    <div class="content">
+      <h1>Lightinator Installer</h1>
+      
+      <p>Select your firmware type:</p>
+      <ul class="radios">
+        <li><label><input type="radio" name="type" value="debug" /> Debug</label></li>
+        <li><label><input type="radio" name="type" value="release" /> Release</label></li>
+      </ul>
+
+      <div class="button-row" style="text-align: center; margin: 30px 0;">
+        <esp-web-install-button class="invisible"></esp-web-install-button>
+      </div>
+
+      <h3>Direct Downloads</h3>
+      <table>
+          <tr>
+              <td><strong>ESP8266</strong></td>
+              <td><a href="./download/esp8266/develop/debug/app-merged.bin">Debug</a></td>
+              <td><a href="./download/esp8266/develop/release/app-merged.bin">Release</a></td>
+          </tr>
+          <tr>
+              <td><strong>ESP32</strong></td>
+              <td><a href="./download/esp32/develop/debug/app-merged.bin">Debug</a></td>
+              <td><a href="./download/esp32/develop/release/app-merged.bin">Release</a></td>
+          </tr>
+          <tr>
+              <td><strong>ESP32-C3</strong></td>
+              <td><a href="./download/esp32c3/develop/debug/app-merged.bin">Debug</a></td>
+              <td><a href="./download/esp32c3/develop/release/app-merged.bin">Release</a></td>
+          </tr>
+      </table>
+
+      <h3>Manual Installation</h3>
+      <p>Flash images to address <code>0x000000</code>. On Linux:</p>
+      <pre>pip install esptool
+python -m esptool --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x0 app-merged.bin</pre>
+
+      <h3>Real-time Controller Status</h3>
+      <iframe
+          src="https://lightinator.de/dashboard/public-dashboards/95c273957df845b59c9113abde30dba2"
+          width="100%"
+          height="800"
+	  style="border: none; width: 100%; display: block;"
+          frameborder="0">
+      </iframe>
+
+      <div class="footer">
+        <a href="https://github.com/pljakobs/esp_rgbww_firmware">RGBWW Firmware</a> | 
+        <a href="https://github.com/pljakobs/esp_rgb_webapp2">RGBWW Webapp</a><br>
+        Installer powered by ESP Web Tools
+      </div>
+    </div>
+
+    <script>
+      document.querySelectorAll('input[name="type"]').forEach(radio =>
+        radio.addEventListener("change", () => {
+          const button = document.querySelector('esp-web-install-button');
+          button.manifest = `./manifest_${radio.value}.json`;
+          button.classList.remove('invisible');
+        }
+      ));
+    </script>
+  </body>
+</html>

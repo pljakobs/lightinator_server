@@ -1,0 +1,25 @@
+{
+  "name": "Lightinator",
+  "version": "5",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "download/esp32/release/app-merged.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32C3",
+      "parts": [
+        { "path": "download/esp32c3/release/app-merged.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP8266",
+      "parts": [
+        { "path": "download/esp8266/release/app-merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
