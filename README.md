@@ -6,12 +6,65 @@
 
 Server-side configuration and tooling for [lightinator.de](https://lightinator.de).
 
+## Active Publishing Path
+
+Publishing continues through the secured SSH/rsync process, not HTTP uploads.
+The server-side `manage_version.py` now writes SQLite directly. Its first
+`version.json` argument is retained for CLI compatibility but is never read or
+written. The public JSON endpoint is a database projection.
+
+Deploy the compatible server/database schema before enabling the updated
+firmware/webapp workflows. They retain per-run publisher uploads, but source them
+from this server repository, not a firmware checkout. In both publishing repositories,
+set the Actions repository variable `DISTRIBUTION_PUBLISHER_SHA` to a reviewed,
+published, lowercase 40-character commit SHA containing the updated publisher and
+tests. There is deliberately no moving-branch or default-pin fallback.
+
+CI checks out and tests exactly that revision, then uploads a run-specific bundle
+containing the renamed publisher, its API/importer modules, and required brand
+assets. Firmware and webapp bundles use distinct prefixes. The remote script uses
+the server virtualenv and explicit database/webroot paths, checks the source pin and
+requires `--publisher-contract` to return `lightinator-sqlite-v1`, then removes only
+its own bundle. It does not replace or delete the installed server code.
+
+The following is an equivalent manual server-side invocation; CI executes its
+uploaded run-specific copy instead:
+
+```bash
+export VERSION_DB_PATH=/home/github-deploy/lightinator-server/firmware.db
+export VERSION_ASSET_ROOT=/home/github-deploy/nginx/html
+PYTHON=/home/github-deploy/lightinator-server/.venv/bin/python
+SCRIPT=/home/github-deploy/lightinator-server/manage_version.py
+"$PYTHON" "$SCRIPT" --publisher-contract
+"$PYTHON" "$SCRIPT" version.json add esp32 release 5.1/develop V5.1.0 \
+    https://lightinator.de/download/firmware/5.1/develop/V5.1.0/esp32/release/app.bin
+```
+
+The database must already exist; an explicit `--init-db` before the subcommand is
+available for an intentionally new test database. Asset URLs resolve under the
+configured webroot and files must already exist there after rsync. Firmware
+checksums and webapp manifest hashes are computed from those assets. Changed
+content under an existing verified release identity is rejected.
+
+Webapp publishing accepts the existing `--files-json-b64`, `--type`, and
+`--min-firmware` options, plus `--max-firmware` for qualified bridge bundles.
+Explicit API-contract management flags are deferred. Omitted compatibility
+bounds remain unchanged on retries. Firmware accepts optional `--source-sha`,
+`--rgbwwled-version`, and `--upgrade-from-lines`; qualification is not inferred.
+
+`cull` currently retains all releases/assets to avoid deleting an upgrade bridge.
+`delete` removes selected legacy database records but deliberately retains files;
+product-aware signed releases are not deleted through this command. HTTP
+publishing and release lifecycle routes are not registered by this discovery app.
+Enabling them later requires a separate application and security review.
+No production publication is performed by the test suite.
+
 ## Contents
 
 | Path | Description |
 |------|-------------|
-| `manage_version.py` | CLI tool to manage `version.json` (canonical home — firmware repo carries a copy) |
-| `version_api.py` | Read-only HTTP API over `version.json`, listens on `0.0.0.0:8765` (host); nginx container proxies `/api/` via `host.containers.internal:8765` |
+| `manage_version.py` | Canonical SQLite publisher invoked through secured SSH after rsync; JSON is not writable storage. |
+| `version_api.py` | Database-backed discovery and legacy JSON views, listens on `0.0.0.0:8765`; HTTP publishing is disabled by default. |
 | `containers/nginx.container` | Podman Quadlet unit for the nginx reverse proxy |
 | `nginx/default.conf` | nginx site config — deployed to `/home/github-deploy/nginx/conf.d/` |
 | `fail2ban/filter.d/` | Custom fail2ban filters (gh-knocker, nginx-podlet-access) |

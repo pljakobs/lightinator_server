@@ -4,7 +4,9 @@ import sys
 import re
 import shutil
 import base64
-import requests
+import argparse
+import hashlib
+from pathlib import Path
 from urllib.parse import urlparse
 
 # Note: webapp bundle sizes are derived by version_api.py (per-file "size" and a
@@ -541,7 +543,9 @@ def list_webapp_entries(data, branch=None):
     return entries
 
 
-def main():
+def legacy_json_main():
+    global requests
+    import requests
     if len(sys.argv) < 3:
         print("Usage: script.py <json_file_or_url> [add|delete|list|cull] [arguments]")
         return
@@ -696,6 +700,199 @@ def main():
         return
 
     print("Invalid action. Use add, delete, list, cull, add-webapp, or list-webapp.")
+
+def database_main(arguments=None):
+    arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments == ["--publisher-contract"]:
+        print("lightinator-sqlite-v1")
+        return
+    import version_api as api
+
+    parser = argparse.ArgumentParser(description="Publish rsynced assets directly to SQLite; JSON is a read-only projection")
+    parser.add_argument("catalogue", help="Legacy catalogue argument (never read or written)")
+    parser.add_argument("--db", default=os.getenv("VERSION_DB_PATH", str(Path(__file__).with_name("firmware.db"))))
+    parser.add_argument("--init-db", action="store_true", help="Explicitly initialize a missing database")
+    parser.add_argument("--asset-root", type=Path, default=os.getenv("VERSION_ASSET_ROOT") or os.getenv("VERSION_LEGACY_ASSET_ROOT"))
+    commands = parser.add_subparsers(dest="action", required=True)
+    firmware = commands.add_parser("add")
+    for name in ("soc", "type", "branch", "version", "url"):
+        firmware.add_argument(name)
+    firmware.add_argument("--comment-b64", default="")
+    firmware.add_argument("--source-sha", default=None)
+    firmware.add_argument("--rgbwwled-version", default=None)
+    firmware.add_argument("--upgrade-from-lines", nargs="*", default=None)
+    webapp = commands.add_parser("add-webapp")
+    webapp.add_argument("branch")
+    webapp.add_argument("version")
+    webapp.add_argument("--files-json-b64", default="")
+    webapp.add_argument("--comment-b64", default="")
+    webapp.add_argument("--type", choices=("debug", "release"), default="debug")
+    for name in ("min-firmware", "max-firmware", "basepath"):
+        webapp.add_argument(f"--{name}", default=None)
+    for action in ("list", "delete"):
+        command = commands.add_parser(action)
+        for name in ("soc", "type", "branch"):
+            command.add_argument(name, nargs="?" if action == "list" else None)
+        if action == "delete":
+            command.add_argument("version", nargs="?")
+            command.add_argument("--keep-files", action="store_true")
+        else:
+            command.add_argument("--history", action="store_true")
+            command.add_argument("--check-urls", action="store_true")
+    listing = commands.add_parser("list-webapp")
+    listing.add_argument("branch", nargs="?")
+    cull = commands.add_parser("cull")
+    cull.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(arguments)
+    database = Path(args.db)
+    if not database.is_absolute():
+        database = Path(__file__).parent / database
+    if not database.is_file() and not args.init_db:
+        raise ValueError("Database does not exist; deploy the server first or explicitly use --init-db")
+    api.DB_PATH = str(database.resolve())
+    api.init_db()
+    root = Path(args.asset_root or Path(args.catalogue).resolve().parent).resolve()
+
+    def local_asset(url):
+        from urllib.parse import unquote
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.scheme not in {"http", "https"}:
+            raise ValueError("Asset URL must use HTTP or HTTPS")
+        asset = (root / unquote(parsed.path).lstrip("/")).resolve()
+        if not asset.is_relative_to(root):
+            raise ValueError("Asset URL escapes the configured webroot")
+        return asset
+
+    def comment():
+        return base64.b64decode(args.comment_b64, validate=True).decode("utf-8") if args.comment_b64 else ""
+
+    if args.action == "add":
+        soc, build_type, branch = args.soc.lower(), args.type.lower(), args.branch.lower()
+        identity = api.release_identity(args.version, branch)
+        if identity is None or build_type not in {"debug", "release"}:
+            raise ValueError("Invalid firmware line, stage or build type")
+        with api.get_db_connection() as connection:
+            product = connection.execute("SELECT target_policy_json FROM ota_products WHERE product_id = 'controller' AND enabled = 1").fetchone()
+        policy = json.loads(product["target_policy_json"]) if product else {}
+        if soc not in policy.get(identity["release_line"], []):
+            raise ValueError("SoC is not supported on the selected release line")
+        expected = {"5.0": "0.10.1", "5.1": "0.11.0"}.get(identity["release_line"])
+        if args.rgbwwled_version and expected and args.rgbwwled_version != expected:
+            raise ValueError("RGBWWLed version does not match release line")
+        if args.upgrade_from_lines and any(not re.fullmatch(r"\d+\.\d+", line) for line in args.upgrade_from_lines):
+            raise ValueError("Invalid qualified source release line")
+        asset = local_asset(args.url)
+        if not asset.is_file() or asset.name == "app-merged.bin" or "single_image" in asset.parts:
+            raise ValueError("A deployed OTA application binary is required, not a merged flash image")
+        payload = asset.read_bytes()
+        if not payload:
+            raise ValueError("Firmware binary is empty")
+        checksum = hashlib.sha256(payload).hexdigest()
+        text = comment()
+        with api.get_db_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute("SELECT * FROM firmware_builds WHERE soc = ? AND type = ? AND branch = ? AND version = ?",
+                                          (soc, build_type, branch, args.version)).fetchone()
+            if existing and (existing["url"] != args.url or (existing["sha256"] and existing["sha256"] != checksum)):
+                raise ValueError("Published artifact is immutable; use a new version")
+            approved = json.dumps(args.upgrade_from_lines) if args.upgrade_from_lines is not None else (existing["upgrade_from_lines"] if existing else None)
+            source_sha = args.source_sha if args.source_sha is not None else (existing["source_sha"] if existing else None)
+            component = args.rgbwwled_version if args.rgbwwled_version is not None else (existing["rgbwwled_version"] if existing else None)
+            connection.execute("""INSERT INTO firmware_builds
+                (soc, type, branch, version, file_path, url, comment, release_line, stage, sha256, size, source_sha, rgbwwled_version, upgrade_from_lines)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(soc, branch, type, version) DO UPDATE SET
+                    file_path=excluded.file_path, comment=excluded.comment,
+                    release_line=excluded.release_line, stage=excluded.stage,
+                    sha256=excluded.sha256, size=excluded.size, source_sha=excluded.source_sha,
+                    rgbwwled_version=excluded.rgbwwled_version, upgrade_from_lines=excluded.upgrade_from_lines""",
+                (soc, build_type, branch, args.version, str(asset), args.url, text or (existing["comment"] if existing else ""),
+                 identity["release_line"], identity["stage"], checksum, len(payload), source_sha, component, approved))
+        print(f"Published firmware to SQLite: {soc}/{identity['source_ref']}/{build_type} {args.version}")
+        return
+
+    if args.action == "add-webapp":
+        if not all(api._safe_segment(value) for value in args.branch.split("/")) or not api._safe_segment(args.version):
+            raise ValueError("Invalid webapp path")
+        branch = args.branch.lower()
+        basepath = args.basepath or f"{api.DOWNLOAD_BASE_URL}/download/webui/{branch}/{args.version}/"
+        directory = local_asset(basepath)
+        if not any((directory / name).is_file() for name in ("index.html", "index.html.gz")):
+            raise ValueError("Deployed webapp has no root entry point")
+        manifest = api.webapp_manifest({"file_path": str(directory), "version": args.version, "branch": branch, "basepath": basepath})
+        if args.files_json_b64:
+            expected_files = json.loads(base64.b64decode(args.files_json_b64, validate=True).decode("utf-8"))
+            actual_files = {entry["filename"]: entry for entry in manifest["files"]}
+            if not isinstance(expected_files, list):
+                raise ValueError("File manifest must be an array")
+            for entry in expected_files:
+                name = (entry.get("filename") or entry.get("path")) if isinstance(entry, dict) else None
+                if name not in actual_files or entry.get("md5") != actual_files[name]["md5"]:
+                    raise ValueError("Deployed asset does not match the CI file manifest")
+        digest_entries = [(entry["filename"], hashlib.sha256((directory / entry["filename"]).read_bytes()).hexdigest()) for entry in manifest["files"]]
+        checksum = hashlib.sha256(api._canonical_json(digest_entries)).hexdigest()
+        text = comment()
+        with api.get_db_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute("SELECT * FROM webapp_builds WHERE branch = ? AND version = ?", (branch, args.version)).fetchone()
+            if existing and ((existing["sha256"] and existing["sha256"] != checksum) or existing["basepath"] != basepath):
+                raise ValueError("Published webapp is immutable; use a new version")
+            values = {}
+            for key in ("min_firmware", "max_firmware", "api_min", "api_max", "required_capabilities"):
+                value = getattr(args, key, None)
+                values[key] = value if value is not None else ((existing[key] or "") if existing else "")
+            required = json.loads(values["required_capabilities"] or "[]")
+            if not isinstance(required, list) or not all(isinstance(value, str) for value in required):
+                raise ValueError("Invalid required capabilities")
+            if values["max_firmware"] and (not values["min_firmware"] or api.parse_version_components(values["max_firmware"]) <= api.parse_version_components(values["min_firmware"])):
+                raise ValueError("Invalid firmware compatibility range")
+            connection.execute("""INSERT INTO webapp_builds
+                (branch, version, type, file_path, basepath, comment, min_firmware, max_firmware, api_min, api_max, required_capabilities, sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(branch, version) DO UPDATE SET comment=excluded.comment,
+                    min_firmware=excluded.min_firmware, max_firmware=excluded.max_firmware,
+                    api_min=excluded.api_min, api_max=excluded.api_max,
+                    required_capabilities=excluded.required_capabilities, sha256=excluded.sha256""",
+                (branch, args.version, args.type, str(directory), basepath, text or (existing["comment"] if existing else ""),
+                 values["min_firmware"], values["max_firmware"], values["api_min"], values["api_max"], json.dumps(required), checksum))
+        print(f"Published webapp to SQLite: {branch} {args.version}")
+        return
+
+    if args.action == "cull":
+        print("Retention deferred: preserving firmware, bridge webapps and files until upgrade-path retention is qualified")
+        return
+    if args.action == "delete":
+        with api.get_db_connection() as connection:
+            query = "DELETE FROM firmware_builds WHERE soc = ? AND type = ? AND branch = ?"
+            parameters = [args.soc.lower(), args.type.lower(), args.branch.lower()]
+            if args.version:
+                query += " AND version = ?"
+                parameters.append(args.version)
+            cursor = connection.execute(query, parameters)
+            print(f"Removed {cursor.rowcount} database records; asset files retained")
+        return
+    with api.get_db_connection() as connection:
+        if args.action == "list-webapp":
+            rows = [dict(row) for row in connection.execute("SELECT branch, version, type, basepath, min_firmware, max_firmware FROM webapp_builds")]
+        else:
+            rows = [dict(row) for row in connection.execute("SELECT soc, type, branch, version, url FROM firmware_builds")]
+    rows = [row for row in rows if all(not getattr(args, key, None) or row.get(key) == getattr(args, key) for key in ("soc", "type", "branch"))]
+    rows.sort(key=lambda row: api.version_sort_key(row["version"]), reverse=True)
+    if args.action == "list" and not args.history:
+        latest = {}
+        for row in rows:
+            latest.setdefault((row["soc"], row["type"], row["branch"]), row)
+        rows = list(latest.values())
+    print(json.dumps(rows, indent=2))
+
+
+def main():
+    try:
+        database_main()
+    except (ValueError, OSError) as error:
+        print(f"Publication failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
 
 if __name__ == "__main__":
     main()

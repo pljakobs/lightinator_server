@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import hashlib
+import io
+import logging
 import hmac
 import json
 import re
@@ -25,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,6 +43,10 @@ CI_TOKEN = os.getenv("CI_UPLOAD_TOKEN", "")
 OTA_PROMOTION_TOKEN = os.getenv("OTA_PROMOTION_TOKEN", "")
 OTA_ADMIN_TOKEN = os.getenv("OTA_ADMIN_TOKEN", "")
 PUBLIC_KEY_HEX = os.getenv("RELEASE_PUBLIC_KEY_HEX", "")
+PUBLISHING_API_ENABLED = os.getenv("ENABLE_PUBLISHING_API", "0") == "1"
+LEGACY_CATALOG_PATH = os.getenv("VERSION_LEGACY_CATALOG", "")
+LEGACY_ASSET_ROOT = os.getenv("VERSION_LEGACY_ASSET_ROOT", "")
+_legacy_catalogue_stamp = None
 MAX_OTA_ARTIFACT_SIZE = 64 * 1024 * 1024
 MAX_OTA_RELEASE_SIZE = 512 * 1024 * 1024
 DEFAULT_OTA_PRODUCT = "controller"
@@ -127,6 +133,15 @@ def init_db() -> None:
             );
             """
         )
+        firmware_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(firmware_builds)")}
+        for name, kind in {"release_line": "TEXT", "stage": "TEXT", "sha256": "TEXT", "size": "INTEGER",
+                           "source_sha": "TEXT", "rgbwwled_version": "TEXT", "upgrade_from_lines": "TEXT"}.items():
+            if name not in firmware_columns:
+                cursor.execute(f"ALTER TABLE firmware_builds ADD COLUMN {name} {kind}")
+        webapp_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(webapp_builds)")}
+        for name in ("max_firmware", "api_min", "api_max", "required_capabilities", "sha256", "files_json"):
+            if name not in webapp_columns:
+                cursor.execute(f"ALTER TABLE webapp_builds ADD COLUMN {name} TEXT")
         product_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(ota_products)")}
         if "publisher_repository" not in product_columns:
             cursor.execute("ALTER TABLE ota_products ADD COLUMN publisher_repository TEXT NOT NULL DEFAULT ''")
@@ -226,7 +241,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "HEAD", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -235,6 +250,13 @@ app.mount(
         StaticFiles(directory=Path(__file__).parent / "images"),
         name="brand",
 )
+
+
+@app.middleware("http")
+async def publishing_api_gate(request: Request, call_next):
+    if not PUBLISHING_API_ENABLED and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        return JSONResponse(status_code=404, content={"detail": "HTTP publishing is disabled; use manage_version.py"})
+    return await call_next(request)
 
 
 @app.get("/api/docs", include_in_schema=False)
@@ -394,6 +416,7 @@ class OTAReleaseManifest(BaseModel):
     source_commit: str = Field(min_length=40, max_length=64)
     changelog: List[OTAChangelogEntry] = Field(min_length=1, max_length=200)
     targets: List[OTATargetManifest] = Field(min_items=1, max_items=64)
+    upgrade_from_lines: Optional[List[str]] = Field(default=None, max_length=20)
 
     class Config:
         extra = "forbid"
@@ -447,6 +470,8 @@ def _validate_target_policy(target_policy: dict[str, List[str]]) -> dict[str, Li
 
 
 def _validate_manifest_targets(product: sqlite3.Row, version_line: str, manifest: OTAReleaseManifest) -> None:
+    if any(not re.fullmatch(r"\d+\.\d+", line) for line in (manifest.upgrade_from_lines or [])):
+        raise HTTPException(status_code=422, detail="Qualified upgrade sources must be major.minor lines")
     target_policy = json.loads(product["target_policy_json"])
     allowed_socs = {soc.lower() for soc in target_policy.get(version_line, [])}
     if not allowed_socs:
@@ -457,6 +482,7 @@ def _validate_manifest_targets(product: sqlite3.Row, version_line: str, manifest
 
 
 @app.get("/api/ota/products", tags=["OTA Release Catalog"])
+@app.get("/api/products", tags=["Product Discovery"])
 def list_ota_products():
     with get_db_connection() as conn:
         rows = conn.execute(
@@ -993,6 +1019,322 @@ def download_ota_artifact(release_id: str, artifact_id: str):
 # CI Upload Endpoints
 # ---------------------------------------------------------------------------
 
+def sync_legacy_catalogue() -> None:
+    global _legacy_catalogue_stamp
+    if not LEGACY_CATALOG_PATH:
+        return
+    source = Path(LEGACY_CATALOG_PATH)
+    try:
+        stat = source.stat()
+        stamp = (str(source.resolve()), DB_PATH, stat.st_mtime_ns, stat.st_size)
+        if stamp == _legacy_catalogue_stamp:
+            return
+        from migrate_to_sqlite import import_catalogue
+        import_catalogue(source, Path(LEGACY_ASSET_ROOT) if LEGACY_ASSET_ROOT else source.parent)
+        _legacy_catalogue_stamp = stamp
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        logging.getLogger(__name__).warning("Legacy catalogue import deferred; retaining existing records: %s", error)
+
+
+def catalogue_firmware_entries(include_new_lines: bool = False, product: str = DEFAULT_OTA_PRODUCT) -> list[dict[str, Any]]:
+    sync_legacy_catalogue()
+    with get_db_connection() as conn:
+        legacy = [dict(row) for row in conn.execute(
+            "SELECT id, soc, type, branch, version, url, COALESCE(comment, '') AS comment, release_line, stage, sha256, size, source_sha, rgbwwled_version, upgrade_from_lines FROM firmware_builds"
+        )]
+        published = conn.execute(
+            """SELECT r.release_id, r.version, r.source_commit, r.changelog_json, r.manifest_json,
+                      c.channel, a.artifact_id, a.hardware, a.hardware_revision,
+                      a.soc, a.build_type, a.sha256, a.size
+               FROM ota_releases r JOIN ota_artifacts a USING (release_id)
+               JOIN ota_release_channels c USING (release_id)
+               JOIN ota_products p ON p.product_id = r.product_id
+                             WHERE r.product_id = ? AND p.enabled = 1
+                                 AND r.status = 'published' AND a.role = 'firmware' AND a.uploaded = 1""", (product,)
+        ).fetchall()
+        if product != DEFAULT_OTA_PRODUCT:
+                legacy = []
+    groups: dict[tuple, list] = {}
+    for row in published:
+        if not include_new_lines and not row["channel"].startswith("5.0/"):
+            continue
+        key = (row["version"], row["channel"], row["soc"], row["build_type"])
+        groups.setdefault(key, []).append(row)
+    entries = [entry for entry in legacy if include_new_lines or parse_version_components(entry["version"])[:2] <= (5, 0)]
+    for rows in groups.values():
+        if len(rows) != 1:
+            continue
+        row = rows[0]
+        entries.append({
+            "soc": row["soc"], "type": row["build_type"], "branch": row["channel"],
+            "version": row["version"], "comment": "\n".join(
+                entry["subject"] for entry in json.loads(row["changelog_json"])),
+            "url": f"{DOWNLOAD_BASE_URL}/api/ota/artifacts/{row['release_id']}/{row['artifact_id']}",
+            "id": f"{row['release_id']}:{row['artifact_id']}:{row['channel']}",
+            "release_id": row["release_id"], "artifact_id": row["artifact_id"],
+            "sha256": row["sha256"], "size": row["size"], "source_sha": row["source_commit"],
+            "upgrade_from_lines": json.loads(row["manifest_json"]).get("upgrade_from_lines", []),
+        })
+    return sorted(entries, key=lambda entry: (version_sort_key(entry["version"]),
+                  entry["branch"], entry["soc"], entry["type"], entry["url"]), reverse=True)
+
+
+def legacy_catalogue_view() -> dict[str, Any]:
+    current: dict[tuple, dict] = {}
+    history = []
+    for entry in catalogue_firmware_entries():
+        branch = entry["branch"]
+        if entry.get("release_id") and branch.startswith("5.0/"):
+            branch = {"develop": "develop", "testing": "testing", "prod": "stable"}[branch.split("/")[1]]
+        identity = (entry["soc"], branch, entry["type"])
+        projected = {"soc": entry["soc"], "type": entry["type"], "branch": branch,
+                     "version": entry["version"], "fw_version": entry["version"],
+                     "comment": entry["comment"], "files": {"rom": {"url": entry["url"]}}}
+        if identity in current:
+            history.append(projected)
+        else:
+            current[identity] = projected
+    with get_db_connection() as conn:
+        webapps = [dict(row) for row in conn.execute(
+            "SELECT branch, version, type, file_path, files_json, basepath, COALESCE(min_firmware, '') AS min_firmware, COALESCE(comment, '') AS comment FROM webapp_builds ORDER BY branch, version"
+        )]
+    webapp_current = {}
+    webapp_history = []
+    for entry in sorted(webapps, key=lambda entry: version_sort_key(entry["version"]), reverse=True):
+        try:
+            manifest = webapp_manifest(entry, allow_missing=True)
+        except HTTPException:
+            continue
+        entry = {key: value for key, value in entry.items() if key not in {"file_path", "files_json"}} | {
+            "files": [{**asset, "path": asset["filename"]} for asset in manifest["files"]], "total_size": manifest["total_size"]}
+        if entry["branch"] in webapp_current:
+            webapp_history.append(entry)
+        else:
+            webapp_current[entry["branch"]] = entry
+    rom = next((entry["files"]["rom"] | {"fw_version": entry["version"]}
+                for entry in current.values() if entry["soc"] == "esp8266" and entry["type"] == "release"), {})
+    return {"rom": rom, "spiffs": {}, "firmware": list(current.values()), "history": history,
+            "webapp": list(webapp_current.values()), "webapp_history": webapp_history}
+
+
+@app.get("/version.json", tags=["Legacy Compatibility"])
+@app.get("/api/version.json", tags=["Legacy Compatibility"])
+def get_legacy_catalogue():
+    return legacy_catalogue_view()
+
+
+def release_identity(version: str, branch: str) -> Optional[dict[str, str]]:
+    match = re.match(r"^[Vv]?(\d+)\.(\d+)(?:\.|-|$)", version)
+    if not match:
+        return None
+    line = f"{int(match[1])}.{int(match[2])}"
+    suffix = branch.lower().strip()
+    qualified = re.fullmatch(r"(\d+\.\d+)[/-](develop|testing|test|prod|stable|experimental)", suffix)
+    if qualified:
+        if qualified[1] != line:
+            return None
+        suffix = qualified[2]
+    stage = {"develop": "develop", "devel": "develop", "experimental": "develop", "test": "testing", "testing": "testing", "stable": "prod", "prod": "prod"}.get(suffix)
+    return {"release_line": line, "stage": stage, "source_ref": f"{line}/{stage}"} if stage else None
+
+
+def version_sort_key(version: str) -> tuple:
+    match = re.fullmatch(r"[Vv]?(\d+)\.(\d+)(?:\.(\d+))?(?:-([^+]+))?(?:\+.*)?", version)
+    if not match:
+        return (-1, -1, -1, 0, ())
+    prerelease = match[4]
+    identifiers = prerelease.split(".") if prerelease else []
+    legacy = re.match(r"^(\d+)(?:-|$)", prerelease or "")
+    if legacy:
+        identifiers = [legacy[1]]
+    return (int(match[1]), int(match[2]), int(match[3] or 0), int(not prerelease),
+            tuple((0, int(value)) if value.isdigit() else (1, value) for value in identifiers))
+
+
+def firmware_candidates(soc: str, product: str = DEFAULT_OTA_PRODUCT) -> list[dict[str, Any]]:
+    product = product.lower()
+    _enabled_ota_product(product)
+    candidates = []
+    for entry in catalogue_firmware_entries(include_new_lines=True, product=product):
+        if entry["soc"] != soc.lower() or entry["type"] not in {"debug", "release"}:
+            continue
+        identity = release_identity(entry["version"], entry["branch"])
+        if identity is None or (product == DEFAULT_OTA_PRODUCT and soc.lower() == "esp8266" and identity["release_line"] != "5.0"):
+            continue
+        if any(entry.get(key) and entry[key] != identity[key] for key in ("release_line", "stage")):
+            continue
+        identifier = entry["id"] if entry.get("release_id") else f"legacy:{entry['id']}"
+        candidates.append({**entry, **identity, "id": identifier, "build_type": entry["type"], "product": product})
+    return sorted(candidates, key=lambda entry: (version_sort_key(entry["version"]), str(entry["id"])), reverse=True)
+
+
+@app.get("/api/v2/firmware/options", tags=["Version-aware Firmware Discovery"])
+def firmware_options(soc: str, release_line: Optional[str] = None, build_type: Optional[str] = None, product: str = DEFAULT_OTA_PRODUCT):
+    candidates = firmware_candidates(soc, product)
+    combinations = {(entry["release_line"], entry["stage"], entry["build_type"]) for entry in candidates
+                    if (not release_line or release_line == entry["release_line"])
+                    and (not build_type or build_type == entry["build_type"])}
+    ordered = sorted(combinations, key=lambda values: (tuple(map(int, values[0].split("."))), values[1:]))
+    return {"soc": soc.lower(), "product": product.lower(), "combinations": [dict(zip(("release_line", "stage", "build_type"), values)) for values in ordered]}
+
+
+@app.get("/api/v2/firmware/versions", tags=["Version-aware Firmware Discovery"])
+def firmware_versions_v2(soc: str, release_line: str, stage: str, build_type: str, product: str = DEFAULT_OTA_PRODUCT):
+    stage = {"test": "testing", "stable": "prod"}.get(stage, stage)
+    if not re.fullmatch(r"\d+\.\d+", release_line) or stage not in {"develop", "testing", "prod"} or build_type not in {"debug", "release"}:
+        raise HTTPException(status_code=422, detail="Invalid release line, stage or build type")
+    return [entry for entry in firmware_candidates(soc, product) if entry["release_line"] == release_line
+            and entry["stage"] == stage and entry["build_type"] == build_type]
+
+
+@app.get("/api/v2/firmware/latest", tags=["Version-aware Firmware Discovery"])
+def firmware_latest_v2(soc: str, release_line: str, stage: str, build_type: str, product: str = DEFAULT_OTA_PRODUCT):
+    candidates = firmware_versions_v2(soc, release_line, stage, build_type, product)
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No firmware matching requested parameters")
+    return candidates[0]
+
+
+@app.get("/api/v2/firmware/transition", tags=["Version-aware Firmware Discovery"])
+def firmware_transition(soc: str, installed_version: str, target_id: str, installed_webapp_version: str = "", product: str = DEFAULT_OTA_PRODUCT):
+    source = re.match(r"^[Vv]?(\d+\.\d+)(?:\.|-|$)", installed_version)
+    target = next((entry for entry in firmware_candidates(soc, product) if str(entry["id"]) == target_id), None)
+    if source is None or target is None:
+        raise HTTPException(status_code=422, detail="Installed identity or target release is unavailable")
+    if source[1] == target["release_line"]:
+        return {"status": "ready", "steps": ["install_firmware"]}
+    allowed_lines = target.get("upgrade_from_lines") or []
+    if isinstance(allowed_lines, str):
+        try:
+            allowed_lines = json.loads(allowed_lines)
+        except ValueError:
+            allowed_lines = []
+    if not isinstance(allowed_lines, list) or source[1] not in allowed_lines:
+        return {"status": "blocked", "reason": "Cross-line configuration/firmware migration has not been qualified", "steps": []}
+    bridges = []
+    for stage in ("prod", "testing", "develop"):
+        current = webapp_versions_v2(installed_version, stage)
+        future = {entry["id"] for entry in webapp_versions_v2(target["version"], stage)}
+        bridges.extend(entry for entry in current if entry["id"] in future and entry["max_firmware"])
+    installed = next((entry for entry in bridges if entry["version"] == installed_webapp_version), None)
+    if installed:
+        return {"status": "ready", "bridge_version": installed["version"], "steps": ["install_firmware"]}
+    if bridges:
+        return {"status": "bridge_required", "bridge": bridges[0],
+                "reason": f"Install bridge webapp {bridges[0]['version']} before changing firmware line",
+                "steps": ["install_bridge_webapp", "verify_bridge_webapp", "install_firmware"]}
+    return {"status": "blocked", "reason": "No qualified bridge webapp is available; stay on the installed line", "steps": []}
+
+
+def canonical_stage(value: str) -> str:
+    suffix = value.lower().split("/")[-1]
+    qualified = re.fullmatch(r"\d+\.\d+-(develop|testing|test|stable|prod|experimental)", suffix)
+    if qualified:
+        suffix = qualified[1]
+    return {"develop": "develop", "devel": "develop", "experimental": "develop", "testing": "testing", "test": "testing", "stable": "prod", "prod": "prod"}.get(suffix, "")
+
+
+def webapp_manifest(record: dict, allow_missing: bool = False) -> dict:
+    directory = Path(record["file_path"])
+    declared = json.loads(record.get("files_json") or "[]")
+    if not directory.is_dir() and not (allow_missing and declared):
+        raise HTTPException(status_code=404, detail="Webapp files are unavailable")
+    files = []
+    for asset in declared:
+        name = asset.get("filename") or asset.get("path")
+        if not name or not (directory / name).resolve().is_relative_to(directory.resolve()):
+            raise HTTPException(status_code=409, detail="Invalid legacy webapp asset path")
+        path = directory / name
+        if not path.is_file() and not allow_missing:
+            raise HTTPException(status_code=404, detail="Legacy webapp asset is missing")
+        files.append({"filename": name, "md5": asset["md5"],
+                      "size": path.stat().st_size if path.is_file() else asset.get("size", 0)})
+    if files:
+        return {"version": record["version"], "branch": record["branch"], "basepath": record["basepath"],
+                "files": files, "total_size": sum(asset["size"] for asset in files)}
+    for asset in sorted(directory.rglob("*")):
+        if asset.is_symlink():
+            raise HTTPException(status_code=409, detail="Webapp contains unsupported links")
+        if asset.is_file():
+            payload = asset.read_bytes()
+            files.append({"filename": asset.relative_to(directory).as_posix(),
+                          "md5": hashlib.md5(payload, usedforsecurity=False).hexdigest(), "size": len(payload)})
+    if not files:
+        raise HTTPException(status_code=404, detail="Webapp has no installable files")
+    return {"version": record["version"], "branch": record["branch"], "basepath": record["basepath"],
+            "files": files, "total_size": sum(asset["size"] for asset in files)}
+
+
+@app.get("/api/v2/webapp/versions", tags=["Version-aware Webapp Discovery"])
+def webapp_versions_v2(firmware_version: str, stage: str, asset_budget: Optional[int] = None):
+    sync_legacy_catalogue()
+    requested_stage = canonical_stage(stage)
+    firmware_line = re.match(r"^[Vv]?(\d+\.\d+)(?:\.|-|$)", firmware_version)
+    if not requested_stage or firmware_line is None:
+        raise HTTPException(status_code=422, detail="Firmware identity and stage are required")
+    with get_db_connection() as connection:
+        records = [dict(row) for row in connection.execute("SELECT * FROM webapp_builds")]
+    result = []
+    for record in records:
+        if canonical_stage(record["branch"]) != requested_stage:
+            continue
+        minimum, maximum = record["min_firmware"] or "", record["max_firmware"] or ""
+        if minimum and parse_version_components(firmware_version) < parse_version_components(minimum):
+            continue
+        if maximum and parse_version_components(firmware_version) >= parse_version_components(maximum):
+            continue
+        if not maximum:
+            legacy_line = re.match(r"^[Vv]?(\d+\.\d+)(?:\.|-|$)", minimum or record["version"])
+            if legacy_line is None or legacy_line[1] != firmware_line[1]:
+                continue
+        if record["api_min"] or record["api_max"]:
+            continue
+        try:
+            required = json.loads(record["required_capabilities"] or "[]")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(required, list) or not all(isinstance(value, str) for value in required):
+            continue
+        if required:
+            continue
+        try:
+            manifest = webapp_manifest(record)
+        except HTTPException:
+            continue
+        if asset_budget is not None and manifest["total_size"] > asset_budget:
+            continue
+        result.append({**manifest, "id": str(record["id"]), "stage": requested_stage,
+                       "min_firmware": minimum, "max_firmware": maximum})
+    return sorted(result, key=lambda record: version_sort_key(record["version"]), reverse=True)
+
+
+@app.get("/api/v2/webapp/options", tags=["Version-aware Webapp Discovery"])
+def webapp_options_v2(firmware_version: str, asset_budget: Optional[int] = None):
+    return {"stages": [stage for stage in ("develop", "testing", "prod")
+                       if webapp_versions_v2(firmware_version, stage, asset_budget)]}
+
+
+@app.get("/api/v2/webapp/latest", tags=["Version-aware Webapp Discovery"])
+def webapp_latest_v2(firmware_version: str, stage: str, asset_budget: Optional[int] = None):
+    candidates = webapp_versions_v2(firmware_version, stage, asset_budget)
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No compatible webapp; existing installation remains valid")
+    return candidates[0]
+
+
+@app.get("/api/webapp/latest", tags=["Webapp Discovery"])
+def get_latest_webapp(branch: str, firmware_version: str):
+    stage = canonical_stage(branch)
+    if not stage and re.fullmatch(r"\d+\.\d+", branch):
+        stage = canonical_stage(re.sub(r"^[Vv]?\d+\.\d+(?:\.\d+)?-\d+-", "", firmware_version))
+    candidates = webapp_versions_v2(firmware_version, stage)
+    candidate = next((entry for entry in candidates if entry["branch"] == branch or entry["max_firmware"]
+                      or entry["branch"] == f"{parse_version_components(firmware_version)[0]}.{parse_version_components(firmware_version)[1]}/{stage}"), None)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="No compatible webapp in the requested legacy feed")
+    return {key: candidate[key] for key in ("version", "branch", "basepath", "files", "total_size")}
+
+
 @app.post("/api/firmware/upload", status_code=201, tags=["CI Upload"])
 async def upload_firmware(
     soc: str = Form(...),
@@ -1046,45 +1388,63 @@ async def upload_webapp(
     comment: str = Form(""),
     archive: UploadFile = File(...),
     _: None = Depends(verify_token),
+    max_firmware: str = Form(""),
+    api_min: str = Form(""),
+    api_max: str = Form(""),
+    required_capabilities: str = Form("[]"),
 ):
+    if not all(_safe_segment(value) for value in branch.split("/")) or not _safe_segment(version):
+        raise HTTPException(status_code=422, detail="Invalid webapp release path")
+    try:
+        required = json.loads(required_capabilities)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid capability requirements") from exc
+    if not isinstance(required, list) or not all(isinstance(value, str) for value in required):
+        raise HTTPException(status_code=422, detail="Invalid capability requirements")
+    if max_firmware and (not min_firmware or parse_version_components(max_firmware) <= parse_version_components(min_firmware)):
+        raise HTTPException(status_code=422, detail="Invalid firmware compatibility range")
     payload = await archive.read()
     verify_sig(payload, signature)
-
+    checksum = hashlib.sha256(payload).hexdigest()
+    branch = branch.lower()
     target_dir = STATIC_ROOT / "webapps" / branch / version
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    archive_path = target_dir / archive.filename
-    with open(archive_path, "wb") as f:
-        f.write(payload)
-
-    if tarfile.is_tarfile(archive_path):
-        with tarfile.open(archive_path, "r:*") as tar:
-            tar.extractall(path=target_dir, filter="data")
-        archive_path.unlink()
-    else:
-        archive_path.unlink()
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid tar archive")
-
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
     basepath = f"{DOWNLOAD_BASE_URL}/downloads/webapps/{branch}/{version}/"
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO webapp_builds (branch, version, type, min_firmware, file_path, basepath, comment)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(branch, version) DO UPDATE SET
-                type=excluded.type,
-                min_firmware=excluded.min_firmware,
-                file_path=excluded.file_path,
-                basepath=excluded.basepath,
-                comment=excluded.comment,
-                created_at=CURRENT_TIMESTAMP
-            """,
-            (branch.lower(), version, type.lower(), min_firmware, str(target_dir), basepath, comment),
-        )
-        conn.commit()
-
+    with tempfile.TemporaryDirectory(dir=target_dir.parent) as temporary:
+        staging = Path(temporary) / "assets"
+        staging.mkdir()
+        try:
+            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as bundle:
+                if any(not (entry.isfile() or entry.isdir()) for entry in bundle.getmembers()):
+                    raise HTTPException(status_code=422, detail="Archive links and special files are not allowed")
+                bundle.extractall(path=staging, filter="data")
+        except (tarfile.TarError, OSError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid webapp archive") from exc
+        if not any((staging / name).is_file() for name in ("index.html", "index.html.gz")):
+            raise HTTPException(status_code=422, detail="Webapp has no root entry point")
+        with get_db_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute("SELECT * FROM webapp_builds WHERE branch = ? AND version = ?", (branch, version)).fetchone()
+            if existing:
+                unchanged = existing["sha256"] == checksum and all((existing[key] or "") == value for key, value in
+                    (("min_firmware", min_firmware), ("max_firmware", max_firmware), ("api_min", api_min), ("api_max", api_max)))
+                if not unchanged or json.loads(existing["required_capabilities"] or "[]") != required:
+                    raise HTTPException(status_code=409, detail="Webapp release is immutable; publish a new version")
+                return {"status": "success", "basepath": existing["basepath"]}
+            if target_dir.exists():
+                raise HTTPException(status_code=409, detail="Webapp directory already exists")
+            staging.rename(target_dir)
+            try:
+                connection.execute("""INSERT INTO webapp_builds
+                    (branch, version, type, min_firmware, max_firmware, api_min, api_max,
+                     required_capabilities, sha256, file_path, basepath, comment)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (branch, version, type.lower(), min_firmware, max_firmware, api_min, api_max,
+                     json.dumps(required), checksum, str(target_dir), basepath, comment))
+                connection.commit()
+            except Exception:
+                shutil.rmtree(target_dir)
+                raise
     return {"status": "success", "basepath": basepath}
 
 
@@ -1094,71 +1454,35 @@ async def upload_webapp(
 
 @app.get("/api/firmware/socs", response_model=List[str], tags=["Firmware Discovery"])
 def get_firmware_socs(branch: Optional[str] = None, type: Optional[str] = None):
-    query = "SELECT DISTINCT soc FROM firmware_builds WHERE 1=1"
-    params = []
-    if branch:
-        query += " AND branch = ?"
-        params.append(branch.lower())
-    if type:
-        query += " AND type = ?"
-        params.append(type.lower())
-
-    with get_db_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return sorted([row["soc"] for row in rows])
+    return sorted({entry.soc for entry in get_firmware_versions(branch=branch, type=type)})
 
 
 @app.get("/api/firmware/branches", response_model=List[str], tags=["Firmware Discovery"])
 def get_firmware_branches(soc: Optional[str] = None, type: Optional[str] = None):
-    query = "SELECT DISTINCT branch FROM firmware_builds WHERE 1=1"
-    params = []
-    if soc:
-        query += " AND soc = ?"
-        params.append(soc.lower())
-    if type:
-        query += " AND type = ?"
-        params.append(type.lower())
-
-    with get_db_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return sorted([row["branch"] for row in rows])
+    return sorted({entry.branch for entry in get_firmware_versions(soc=soc, type=type)})
 
 
 @app.get("/api/firmware/types", response_model=List[str], tags=["Firmware Discovery"])
 def get_firmware_types(soc: Optional[str] = None, branch: Optional[str] = None):
-    query = "SELECT DISTINCT type FROM firmware_builds WHERE 1=1"
-    params = []
-    if soc:
-        query += " AND soc = ?"
-        params.append(soc.lower())
-    if branch:
-        query += " AND branch = ?"
-        params.append(branch.lower())
-
-    with get_db_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return sorted([row["type"] for row in rows])
+    return sorted({entry.type for entry in get_firmware_versions(soc=soc, branch=branch)})
 
 
 @app.get("/api/firmware/versions", response_model=List[FirmwareEntry], tags=["Firmware Discovery"])
 def get_firmware_versions(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
-    query = "SELECT soc, type, branch, version, url, comment FROM firmware_builds WHERE 1=1"
-    params = []
-    if soc:
-        query += " AND soc = ?"
-        params.append(soc.lower())
-    if branch:
-        query += " AND branch = ?"
-        params.append(branch.lower())
-    if type:
-        query += " AND type = ?"
-        params.append(type.lower())
-
-    with get_db_connection() as conn:
-        rows = [dict(row) for row in conn.execute(query, params).fetchall()]
-
-    rows.sort(key=lambda x: parse_version_components(x["version"]), reverse=True)
-    return [FirmwareEntry(**r) for r in rows]
+    qualified = bool(branch and re.fullmatch(r"\d+\.\d+/(develop|testing|prod)", branch))
+    entries = catalogue_firmware_entries(include_new_lines=qualified)
+    result = []
+    for entry in entries:
+        if soc and entry["soc"] != soc.lower():
+            continue
+        if type and entry["type"] != type.lower():
+            continue
+        if entry.get("release_id") and not qualified and entry["branch"].startswith("5.0/"):
+            entry = {**entry, "branch": {"develop": "develop", "testing": "testing", "prod": "stable"}[entry["branch"].split("/")[1]]}
+        if branch and entry["branch"] != branch.lower():
+            continue
+        result.append(FirmwareEntry(**entry))
+    return result
 
 
 @app.get("/api/firmware/latest", response_model=Union[FirmwareEntry, List[FirmwareEntry]], tags=["Firmware Discovery"])
@@ -1180,6 +1504,7 @@ def get_latest_firmware(soc: Optional[str] = None, branch: Optional[str] = None,
 
 @app.get("/api/webapp/branches", response_model=List[str], tags=["Webapp Discovery"])
 def get_webapp_branches():
+    sync_legacy_catalogue()
     with get_db_connection() as conn:
         rows = conn.execute("SELECT DISTINCT branch FROM webapp_builds").fetchall()
     return sorted([row["branch"] for row in rows])
@@ -1187,7 +1512,8 @@ def get_webapp_branches():
 
 @app.get("/api/webapp/versions", response_model=List[WebappEntry], tags=["Webapp Discovery"])
 def get_webapp_versions(branch: Optional[str] = None, firmware_version: Optional[str] = None):
-    query = "SELECT branch, version, type, basepath, min_firmware, comment FROM webapp_builds WHERE 1=1"
+    sync_legacy_catalogue()
+    query = "SELECT branch, version, type, basepath, COALESCE(min_firmware, '') AS min_firmware, COALESCE(comment, '') AS comment FROM webapp_builds WHERE 1=1"
     params = []
     if branch:
         query += " AND branch = ?"
@@ -1205,6 +1531,12 @@ def get_webapp_versions(branch: Optional[str] = None, firmware_version: Optional
 
     rows.sort(key=lambda x: parse_version_components(x["version"]), reverse=True)
     return [WebappEntry(**r) for r in rows]
+
+
+app.router.routes[:] = [route for route in app.router.routes
+                       if route.path not in {"/api/ota/latest", "/api/ota/artifacts/{release_id}/{artifact_id}"} and
+                       (not getattr(route, "methods", None) or route.methods <= {"GET", "HEAD"})]
+app.openapi_schema = None
 
 
 if __name__ == "__main__":

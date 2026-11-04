@@ -43,13 +43,14 @@ LEGACY_JSON="${DEPLOY_HOME}/nginx/html/version.json"
 TARGET_DB="${REPO_DIR}/firmware.db"
 
 if [[ -f "${LEGACY_JSON}" ]]; then
-    echo "==> Detected legacy version.json, running SQLite migration..."
+    echo "==> Preserving the legacy catalogue and importing missing records..."
     runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/python" \
         "${REPO_DIR}/migrate_to_sqlite.py" \
         --source "${LEGACY_JSON}" \
-        --db "${TARGET_DB}"
-    mv "${LEGACY_JSON}" "${LEGACY_JSON}.bak"
-    echo "    Migration completed successfully."
+        --db "${TARGET_DB}" \
+        --asset-root "${DEPLOY_HOME}/nginx/html" \
+        --backup
+    echo "    Import completed; legacy catalogue remains available."
 fi
 
 # ---------------------------------------------------------------------------
