@@ -7,11 +7,17 @@ Provides secure upload endpoints for CI deployment and read-only version discove
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+import io
+import re
+import shutil
 import sqlite3
 import tarfile
-from contextlib import asynccontextmanager
+import tempfile
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Iterator, List, Optional, Union
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -41,10 +47,15 @@ DISTRIBUTION_ICON_URL = "/api/brand/lightinator-distribution-server-icon-dark.sv
 # Database Helper & Initialization
 # ---------------------------------------------------------------------------
 
-def get_db_connection() -> sqlite3.Connection:
+@contextmanager
+def get_db_connection() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -82,6 +93,15 @@ def init_db() -> None:
             );
             """
         )
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(firmware_builds)")}
+        for name, kind in {"release_line": "TEXT", "stage": "TEXT", "sha256": "TEXT", "size": "INTEGER",
+                           "source_sha": "TEXT", "rgbwwled_version": "TEXT", "upgrade_from_lines": "TEXT"}.items():
+            if name not in columns:
+                cursor.execute(f"ALTER TABLE firmware_builds ADD COLUMN {name} {kind}")
+        webapp_columns = {row[1] for row in cursor.execute("PRAGMA table_info(webapp_builds)")}
+        for name in ("max_firmware", "api_min", "api_max", "required_capabilities", "sha256"):
+            if name not in webapp_columns:
+                cursor.execute(f"ALTER TABLE webapp_builds ADD COLUMN {name} TEXT")
         conn.commit()
 
 
@@ -216,6 +236,115 @@ class WebappEntry(BaseModel):
     comment: str = ""
 
 
+def release_identity(version: str, branch: str) -> dict[str, str] | None:
+    match = re.match(r"^[Vv]?(\d+)\.(\d+)(?:\.|-|$)", version)
+    if not match:
+        return None
+    line = f"{int(match[1])}.{int(match[2])}"
+    normalized = branch.lower().strip()
+    qualified = re.fullmatch(r"(\d+\.\d+)[/-](develop|testing|test|prod|stable|experimental)", normalized)
+    if qualified:
+        if qualified[1] != line:
+            return None
+        normalized = qualified[2]
+    stages = {"develop": "develop", "experimental": "develop", "test": "testing", "testing": "testing", "stable": "prod", "prod": "prod"}
+    stage = stages.get(normalized)
+    if stage is None:
+        return None
+    return {"release_line": line, "stage": stage, "source_ref": f"{line}/{stage}"}
+
+
+def version_sort_key(version: str) -> tuple:
+    match = re.fullmatch(r"[Vv]?(\d+)\.(\d+)(?:\.(\d+))?(?:-([^+]+))?(?:\+.*)?", version)
+    if not match:
+        return (-1, -1, -1, 0, ())
+    prerelease = match[4]
+    identifiers = prerelease.split(".") if prerelease else []
+    legacy = re.match(r"^(\d+)(?:-|$)", prerelease or "")
+    if legacy:
+        identifiers = [legacy[1]]
+    return (int(match[1]), int(match[2]), int(match[3] or 0), int(not prerelease),
+            tuple((0, int(value)) if value.isdigit() else (1, value) for value in identifiers))
+
+
+def firmware_candidates(soc: str) -> list[dict]:
+    result = []
+    with get_db_connection() as connection:
+        metadata = {row["id"]: dict(row) for row in connection.execute("SELECT id, soc, type, branch, version, release_line, stage, sha256, size, source_sha, rgbwwled_version, upgrade_from_lines FROM firmware_builds WHERE soc = ?", (soc.lower(),))}
+    indexed = {(row["soc"], row["type"], row["branch"], row["version"]): row for row in metadata.values()}
+    for entry in get_firmware_versions(soc=soc):
+        identity = release_identity(entry.version, entry.branch)
+        if identity is None or (soc.lower() == "esp8266" and identity["release_line"] != "5.0"):
+            continue
+        if entry.type not in {"debug", "release"}:
+            continue
+        stored = indexed[(entry.soc, entry.type, entry.branch, entry.version)]
+        if stored["release_line"] and stored["release_line"] != identity["release_line"]:
+            continue
+        if stored["stage"] and stored["stage"] != identity["stage"]:
+            continue
+        result.append({**entry.model_dump(), **identity, "build_type": entry.type,
+                       "id": str(stored["id"]), "sha256": stored["sha256"], "size": stored["size"],
+                       "source_sha": stored["source_sha"], "rgbwwled_version": stored["rgbwwled_version"]})
+    return sorted(result, key=lambda entry: version_sort_key(entry["version"]), reverse=True)
+
+
+@app.get("/api/v2/firmware/options", tags=["Version-aware Firmware Discovery"])
+def firmware_options(soc: str, release_line: Optional[str] = None, build_type: Optional[str] = None):
+    candidates = firmware_candidates(soc)
+    if build_type:
+        candidates = [entry for entry in candidates if entry["build_type"] == build_type]
+    if release_line:
+        candidates = [entry for entry in candidates if entry["release_line"] == release_line]
+    combinations = sorted({(entry["release_line"], entry["stage"], entry["build_type"]) for entry in candidates},
+                          key=lambda value: (tuple(map(int, value[0].split("."))), value[1], value[2]))
+    return {"soc": soc.lower(), "combinations": [dict(zip(("release_line", "stage", "build_type"), values)) for values in combinations]}
+
+
+@app.get("/api/v2/firmware/versions", tags=["Version-aware Firmware Discovery"])
+def firmware_versions_v2(soc: str, release_line: str, stage: str, build_type: str):
+    if not re.fullmatch(r"\d+\.\d+", release_line) or build_type not in {"debug", "release"}:
+        raise HTTPException(status_code=422, detail="Invalid release line or build type")
+    stage = {"test": "testing", "stable": "prod"}.get(stage, stage)
+    if stage not in {"develop", "testing", "prod"}:
+        raise HTTPException(status_code=422, detail="Invalid stage")
+    return [entry for entry in firmware_candidates(soc) if entry["release_line"] == release_line
+            and entry["stage"] == stage and entry["build_type"] == build_type]
+
+
+@app.get("/api/v2/firmware/latest", tags=["Version-aware Firmware Discovery"])
+def firmware_latest_v2(soc: str, release_line: str, stage: str, build_type: str):
+    candidates = firmware_versions_v2(soc, release_line, stage, build_type)
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No firmware matching requested parameters")
+    return candidates[0]
+
+
+@app.get("/api/v2/firmware/transition", tags=["Version-aware Firmware Discovery"])
+def firmware_transition(soc: str, installed_version: str, target_id: str, installed_webapp_version: str = ""):
+    source = re.match(r"^[Vv]?(\d+\.\d+)(?:\.|-|$)", installed_version)
+    target = next((entry for entry in firmware_candidates(soc) if entry["id"] == target_id), None)
+    if source is None or target is None:
+        raise HTTPException(status_code=422, detail="Installed identity or target release is unavailable")
+    source_line = tuple(int(component) for component in source[1].split("."))
+    target_line = tuple(int(component) for component in target["release_line"].split("."))
+    if target_line < source_line:
+        return {"status": "blocked", "reason": "Cross-line downgrades require a ConfigDB schema compatibility review", "steps": []}
+    return {"status": "ready", "steps": ["install_firmware"]}
+
+
+def validate_path_component(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) or ".." in value:
+        raise HTTPException(status_code=422, detail="Invalid artifact path component")
+    return value
+
+
+def validate_branch_path(branch: str) -> str:
+    for component in branch.split("/"):
+        validate_path_component(component)
+    return branch
+
+
 # ---------------------------------------------------------------------------
 # CI Upload Endpoints
 # ---------------------------------------------------------------------------
@@ -230,14 +359,51 @@ async def upload_firmware(
     comment: str = Form(""),
     file: UploadFile = File(...),
     _: None = Depends(verify_token),
+    release_line: str = Form(""),
+    stage: str = Form(""),
+    source_sha: str = Form(""),
+    rgbwwled_version: str = Form(""),
+    upgrade_from_lines: str = Form("[]"),
 ):
+    soc, type, branch = soc.lower(), type.lower(), branch.lower()
+    identity = release_identity(version, branch)
+    if identity is None or type not in {"debug", "release"} or soc not in {"esp8266", "esp32", "esp32c3"}:
+        raise HTTPException(status_code=422, detail="Invalid firmware identity")
+    if release_line and release_line != identity["release_line"]:
+        raise HTTPException(status_code=422, detail="Release line does not match version")
+    normalized_stage = {"test": "testing", "stable": "prod"}.get(stage, stage)
+    if normalized_stage and normalized_stage != identity["stage"]:
+        raise HTTPException(status_code=422, detail="Stage does not match branch")
+    if soc == "esp8266" and identity["release_line"] != "5.0":
+        raise HTTPException(status_code=422, detail="Unsupported release line for ESP8266")
+    expected_component = {"5.0": "0.10.1", "5.1": "0.11.0"}.get(identity["release_line"])
+    if rgbwwled_version and expected_component and rgbwwled_version != expected_component:
+        raise HTTPException(status_code=422, detail="Incorrect RGBWWLed version for release line")
+    try:
+        qualified_sources = json.loads(upgrade_from_lines)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid qualified source lines")
+    if not isinstance(qualified_sources, list) or not all(isinstance(line, str) and re.fullmatch(r"\d+\.\d+", line) for line in qualified_sources):
+        raise HTTPException(status_code=422, detail="Invalid qualified source lines")
+    validate_branch_path(branch)
+    validate_path_component(version)
+    validate_path_component(file.filename or "")
     payload = await file.read()
     verify_sig(payload, signature)
+    checksum = hashlib.sha256(payload).hexdigest()
 
     target_dir = STATIC_ROOT / "firmware" / branch / version / soc / type
     target_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = target_dir / file.filename
+    with get_db_connection() as connection:
+        existing = connection.execute("SELECT sha256, url FROM firmware_builds WHERE soc = ? AND type = ? AND branch = ? AND version = ?", (soc, type, branch, version)).fetchone()
+    if existing:
+        if existing["sha256"] != checksum:
+            raise HTTPException(status_code=409, detail="Release already exists with different or unverified content")
+        return {"status": "success", "url": existing["url"]}
+    if file_path.exists() and hashlib.sha256(file_path.read_bytes()).hexdigest() != checksum:
+        raise HTTPException(status_code=409, detail="Artifact path already contains different content")
     with open(file_path, "wb") as f:
         f.write(payload)
 
@@ -248,15 +414,12 @@ async def upload_firmware(
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO firmware_builds (soc, type, branch, version, file_path, url, comment)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(soc, branch, type, version) DO UPDATE SET
-                file_path=excluded.file_path,
-                url=excluded.url,
-                comment=excluded.comment,
-                created_at=CURRENT_TIMESTAMP
+            INSERT INTO firmware_builds (soc, type, branch, version, file_path, url, comment,
+                release_line, stage, sha256, size, source_sha, rgbwwled_version, upgrade_from_lines)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (soc.lower(), type.lower(), branch.lower(), version, str(file_path), full_url, comment),
+            (soc, type, branch, version, str(file_path), full_url, comment,
+             identity["release_line"], identity["stage"], checksum, len(payload), source_sha, rgbwwled_version, json.dumps(qualified_sources)),
         )
         conn.commit()
 
@@ -273,45 +436,63 @@ async def upload_webapp(
     comment: str = Form(""),
     archive: UploadFile = File(...),
     _: None = Depends(verify_token),
+    max_firmware: str = Form(""),
+    api_min: str = Form(""),
+    api_max: str = Form(""),
+    required_capabilities: str = Form("[]"),
 ):
+    branch = validate_branch_path(branch.lower())
+    validate_path_component(version)
+    try:
+        required = json.loads(required_capabilities)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid webapp capability requirements")
+    if not isinstance(required, list) or not all(isinstance(value, str) for value in required):
+        raise HTTPException(status_code=422, detail="Invalid webapp capability requirements")
+    if max_firmware and (not min_firmware or parse_version_components(max_firmware) <= parse_version_components(min_firmware)):
+        raise HTTPException(status_code=422, detail="Invalid webapp firmware compatibility range")
     payload = await archive.read()
     verify_sig(payload, signature)
-
+    checksum = hashlib.sha256(payload).hexdigest()
     target_dir = STATIC_ROOT / "webapps" / branch / version
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    archive_path = target_dir / archive.filename
-    with open(archive_path, "wb") as f:
-        f.write(payload)
-
-    if tarfile.is_tarfile(archive_path):
-        with tarfile.open(archive_path, "r:*") as tar:
-            tar.extractall(path=target_dir, filter="data")
-        archive_path.unlink()
-    else:
-        archive_path.unlink()
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid tar archive")
-
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
     basepath = f"{DOWNLOAD_BASE_URL}/downloads/webapps/{branch}/{version}/"
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO webapp_builds (branch, version, type, min_firmware, file_path, basepath, comment)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(branch, version) DO UPDATE SET
-                type=excluded.type,
-                min_firmware=excluded.min_firmware,
-                file_path=excluded.file_path,
-                basepath=excluded.basepath,
-                comment=excluded.comment,
-                created_at=CURRENT_TIMESTAMP
-            """,
-            (branch.lower(), version, type.lower(), min_firmware, str(target_dir), basepath, comment),
-        )
-        conn.commit()
-
+    with tempfile.TemporaryDirectory(dir=target_dir.parent) as temporary:
+        staging = Path(temporary) / "assets"
+        staging.mkdir()
+        try:
+            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as bundle:
+                if any(not (member.isfile() or member.isdir()) for member in bundle.getmembers()):
+                    raise HTTPException(status_code=422, detail="Webapp archive must not contain links or special files")
+                bundle.extractall(path=staging, filter="data")
+        except (tarfile.TarError, OSError) as error:
+            raise HTTPException(status_code=400, detail="Invalid webapp archive") from error
+        if not any((staging / name).is_file() for name in ("index.html", "index.html.gz")):
+            raise HTTPException(status_code=422, detail="Webapp archive has no root entry point")
+        with get_db_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute("SELECT * FROM webapp_builds WHERE branch = ? AND version = ?", (branch, version)).fetchone()
+            if existing:
+                unchanged = existing["sha256"] == checksum and all((existing[key] or "") == value for key, value in
+                    (("min_firmware", min_firmware), ("max_firmware", max_firmware), ("api_min", api_min), ("api_max", api_max)))
+                unchanged = unchanged and json.loads(existing["required_capabilities"] or "[]") == required
+                if not unchanged:
+                    raise HTTPException(status_code=409, detail="Webapp release is immutable; publish a new version")
+                return {"status": "success", "basepath": existing["basepath"]}
+            if target_dir.exists():
+                raise HTTPException(status_code=409, detail="Webapp artifact directory already exists")
+            staging.rename(target_dir)
+            try:
+                connection.execute("""INSERT INTO webapp_builds
+                    (branch, version, type, min_firmware, max_firmware, api_min, api_max,
+                     required_capabilities, sha256, file_path, basepath, comment)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (branch, version, type.lower(), min_firmware, max_firmware, api_min, api_max,
+                     json.dumps(required), checksum, str(target_dir), basepath, comment))
+                connection.commit()
+            except Exception:
+                shutil.rmtree(target_dir)
+                raise
     return {"status": "success", "basepath": basepath}
 
 
@@ -369,7 +550,7 @@ def get_firmware_types(soc: Optional[str] = None, branch: Optional[str] = None):
 
 @app.get("/api/firmware/versions", response_model=List[FirmwareEntry], tags=["Firmware Discovery"])
 def get_firmware_versions(soc: Optional[str] = None, branch: Optional[str] = None, type: Optional[str] = None):
-    query = "SELECT soc, type, branch, version, url, comment FROM firmware_builds WHERE 1=1"
+    query = "SELECT soc, type, branch, version, url, COALESCE(comment, '') AS comment FROM firmware_builds WHERE 1=1"
     params = []
     if soc:
         query += " AND soc = ?"
@@ -414,7 +595,7 @@ def get_webapp_branches():
 
 @app.get("/api/webapp/versions", response_model=List[WebappEntry], tags=["Webapp Discovery"])
 def get_webapp_versions(branch: Optional[str] = None, firmware_version: Optional[str] = None):
-    query = "SELECT branch, version, type, basepath, min_firmware, comment FROM webapp_builds WHERE 1=1"
+    query = "SELECT branch, version, type, basepath, COALESCE(min_firmware, '') AS min_firmware, COALESCE(comment, '') AS comment FROM webapp_builds WHERE 1=1"
     params = []
     if branch:
         query += " AND branch = ?"
@@ -432,6 +613,103 @@ def get_webapp_versions(branch: Optional[str] = None, firmware_version: Optional
 
     rows.sort(key=lambda x: parse_version_components(x["version"]), reverse=True)
     return [WebappEntry(**r) for r in rows]
+
+
+def canonical_stage(value: str) -> str:
+    suffix = re.split(r"[/]", value.lower())[-1]
+    qualified = re.fullmatch(r"\d+\.\d+-(develop|testing|test|stable|prod|experimental)", suffix)
+    if qualified:
+        suffix = qualified[1]
+    return {"develop": "develop", "experimental": "develop", "testing": "testing", "test": "testing", "stable": "prod", "prod": "prod"}.get(suffix, "")
+
+
+def webapp_manifest(record: dict) -> dict:
+    directory = Path(record["file_path"])
+    if not directory.is_dir():
+        raise HTTPException(status_code=404, detail="Webapp files are unavailable")
+    files = []
+    for asset in sorted(directory.rglob("*")):
+        if asset.is_symlink():
+            raise HTTPException(status_code=409, detail="Webapp contains unsupported links")
+        if asset.is_file():
+            payload = asset.read_bytes()
+            files.append({"filename": asset.relative_to(directory).as_posix(),
+                          "md5": hashlib.md5(payload, usedforsecurity=False).hexdigest(),
+                          "size": len(payload)})
+    if not files:
+        raise HTTPException(status_code=404, detail="Webapp has no installable files")
+    return {"version": record["version"], "branch": record["branch"], "basepath": record["basepath"],
+            "files": files, "total_size": sum(asset["size"] for asset in files)}
+
+
+@app.get("/api/v2/webapp/versions", tags=["Version-aware Webapp Discovery"])
+def webapp_versions_v2(firmware_version: str, stage: str, api_version: str = "", capabilities: str = "", asset_budget: Optional[int] = None):
+    requested_stage = canonical_stage(stage)
+    firmware_line = re.match(r"^[Vv]?(\d+\.\d+)(?:\.|-|$)", firmware_version)
+    if not requested_stage or firmware_line is None:
+        raise HTTPException(status_code=422, detail="Firmware identity and stage are required")
+    with get_db_connection() as connection:
+        records = [dict(row) for row in connection.execute("SELECT * FROM webapp_builds")]
+    result = []
+    for record in records:
+        identity = release_identity(record["version"], record["branch"])
+        if identity is None or identity["stage"] != requested_stage or identity["release_line"] != firmware_line[1]:
+            continue
+        minimum = record["min_firmware"] or ""
+        maximum = record["max_firmware"] or ""
+        if minimum and parse_version_components(firmware_version) < parse_version_components(minimum):
+            continue
+        if maximum and parse_version_components(firmware_version) >= parse_version_components(maximum):
+            continue
+        if record["api_min"] or record["api_max"]:
+            if not api_version:
+                continue
+            if record["api_min"] and version_sort_key(api_version) < version_sort_key(record["api_min"]):
+                continue
+            if record["api_max"] and version_sort_key(api_version) >= version_sort_key(record["api_max"]):
+                continue
+        try:
+            required = json.loads(record["required_capabilities"] or "[]")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(required, list) or not all(isinstance(value, str) for value in required):
+            continue
+        if not set(required).issubset(set(filter(None, capabilities.split(",")))):
+            continue
+        try:
+            manifest = webapp_manifest(record)
+        except HTTPException:
+            continue
+        if asset_budget is not None and manifest["total_size"] > asset_budget:
+            continue
+        result.append({**manifest, "id": str(record["id"]), "stage": requested_stage,
+                       "min_firmware": minimum, "max_firmware": maximum,
+                       "required_capabilities": required})
+    return sorted(result, key=lambda record: version_sort_key(record["version"]), reverse=True)
+
+
+@app.get("/api/v2/webapp/options", tags=["Version-aware Webapp Discovery"])
+def webapp_options_v2(firmware_version: str, api_version: str = "", capabilities: str = "", asset_budget: Optional[int] = None):
+    return {"stages": [stage for stage in ("develop", "testing", "prod")
+                       if webapp_versions_v2(firmware_version, stage, api_version, capabilities, asset_budget)]}
+
+
+@app.get("/api/v2/webapp/latest", tags=["Version-aware Webapp Discovery"])
+def webapp_latest_v2(firmware_version: str, stage: str, api_version: str = "", capabilities: str = "", asset_budget: Optional[int] = None):
+    candidates = webapp_versions_v2(firmware_version, stage, api_version, capabilities, asset_budget)
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No compatible webapp; existing installation remains valid")
+    return candidates[0]
+
+
+@app.get("/api/webapp/latest", tags=["Webapp Discovery"])
+def get_latest_webapp(branch: str, firmware_version: str):
+    stage = canonical_stage(branch)
+    if not stage and re.fullmatch(r"\d+\.\d+", branch):
+        suffix = re.sub(r"^[Vv]?\d+\.\d+(?:\.\d+)?-\d+-", "", firmware_version)
+        stage = canonical_stage(suffix)
+    candidate = webapp_latest_v2(firmware_version, stage)
+    return {key: candidate[key] for key in ("version", "branch", "basepath", "files", "total_size")}
 
 
 if __name__ == "__main__":
