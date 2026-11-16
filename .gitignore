@@ -5,6 +5,10 @@ __pycache__/
 
 # Server secret — never commit
 knock-secret.env
+*.db
+*.db-shm
+*.db-wal
+.venv/
 
 # Editor
 .vscode/

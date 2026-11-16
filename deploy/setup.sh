@@ -1,224 +1,103 @@
 #!/usr/bin/env bash
-# deploy/setup.sh — idempotent full-server bootstrap for lightinator.de
-#
-# Reproduces the complete current setup from scratch on a fresh RHEL/Fedora host.
-# Safe to re-run; all steps check before acting.
-#
-# Usage (run as root):
-#   export DEPLOY_KNOCK_HASH=<64-char hex>   # from the DEPLOY_KNOCK_HASH server secret
-#   bash /home/github-deploy/lightinator-server/deploy/setup.sh
-#
+# Bootstrap host prerequisites, then use the same application deploy as update.sh.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEPLOY_USER="${DEPLOY_USER:-github-deploy}"
-DEPLOY_HOME="/home/${DEPLOY_USER}"
-DOMAIN="${DOMAIN:-lightinator.de}"
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
-
-# ---------------------------------------------------------------------------
-# Load port-knock secret
-# ---------------------------------------------------------------------------
-
-ENV_FILE="${REPO_DIR}/knock-secret.env"
-
-if [[ -f "${ENV_FILE}" ]]; then
-    # shellcheck source=/dev/null
-    source "${ENV_FILE}"
-    echo "==> Loaded knock secret from ${ENV_FILE}"
-elif [[ -z "${DEPLOY_KNOCK_HASH:-}" ]]; then
-    echo "" >&2
-    echo "ERROR: No knock secret found." >&2
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+require_clean_checkout
+load_knock_secret
+if [[ -z "${DEPLOY_KNOCK_HASH:-}" ]]; then
+    echo "ERROR: Configure /etc/lightinator/knock-secret.env before setup." >&2
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 1. System packages
-# ---------------------------------------------------------------------------
+DOMAIN="${DOMAIN:-lightinator.de}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 
-echo "==> Installing system packages..."
-dnf install -y \
-    podman \
-    fail2ban \
-    certbot \
-    python3 \
-    python3.11 \
-    python3.11-pip \
-    firewalld \
-    git
-echo "    done"
-
-# ---------------------------------------------------------------------------
-# 2. github-deploy user + nginx group
-# ---------------------------------------------------------------------------
-
-echo "==> Creating deploy user and groups..."
-if ! getent group nginx &>/dev/null; then
+dnf install -y podman fail2ban certbot python3 python3.11 python3.11-pip firewalld git curl
+if ! getent group nginx >/dev/null; then
     groupadd --system nginx
-    echo "    created group nginx"
 fi
-
-if ! id "${DEPLOY_USER}" &>/dev/null; then
+if ! id "${DEPLOY_USER}" >/dev/null 2>&1; then
     useradd --system --home-dir "${DEPLOY_HOME}" --create-home \
         --shell /bin/bash --groups nginx "${DEPLOY_USER}"
-    echo "    created user ${DEPLOY_USER}"
 else
-    usermod -aG nginx "${DEPLOY_USER}" 2>/dev/null || true
-    echo "    user ${DEPLOY_USER} already exists"
+    usermod -aG nginx "${DEPLOY_USER}"
 fi
-
 install -d -m 700 -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh"
 touch "${DEPLOY_HOME}/.ssh/authorized_keys"
 chmod 600 "${DEPLOY_HOME}/.ssh/authorized_keys"
 chown "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_HOME}/.ssh/authorized_keys"
 
-# ---------------------------------------------------------------------------
-# 3. Python Environment & FastAPI Dependencies
-# ---------------------------------------------------------------------------
-
-echo "==> Setting up version API Python environment..."
-API_PYTHON="${API_PYTHON:-$(command -v python3.11 || command -v python3)}"
-API_PYTHON_VERSION="$(${API_PYTHON} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-VENV_PYTHON_VERSION=""
-
-if [[ -x "${REPO_DIR}/.venv/bin/python" ]]; then
-    VENV_PYTHON_VERSION="$(${REPO_DIR}/.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
-fi
-
-if [[ "${VENV_PYTHON_VERSION}" != "${API_PYTHON_VERSION}" ]]; then
-    rm -rf "${REPO_DIR}/.venv"
-    runuser -u "${DEPLOY_USER}" -- "${API_PYTHON}" -m venv "${REPO_DIR}/.venv"
-fi
-
-runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/pip" install \
-    --disable-pip-version-check --quiet -r "${REPO_DIR}/requirements-api.txt"
-echo "    FastAPI/Uvicorn environment ready"
-
-# ---------------------------------------------------------------------------
-# 4. Firewall
-# ---------------------------------------------------------------------------
-
-echo "==> Configuring firewall..."
 systemctl enable --now firewalld
-for svc in http https ssh; do
-    if ! firewall-cmd --query-service="${svc}" --permanent &>/dev/null; then
-        firewall-cmd --add-service="${svc}" --permanent
-        echo "    opened ${svc}"
+FIREWALL_CHANGED=0
+for service in http https ssh; do
+    if ! firewall-cmd --query-service="${service}" --permanent >/dev/null; then
+        firewall-cmd --add-service="${service}" --permanent
+        FIREWALL_CHANGED=1
     fi
 done
-firewall-cmd --reload
-echo "    firewall configured"
-
-# ---------------------------------------------------------------------------
-# 5. Podman network
-# ---------------------------------------------------------------------------
-
-echo "==> Creating Podman network..."
-if ! podman network exists monitoring-stack 2>/dev/null; then
+if [[ "${FIREWALL_CHANGED}" -eq 1 ]]; then
+    firewall-cmd --reload
+fi
+if ! podman network exists monitoring-stack; then
     podman network create monitoring-stack
-    echo "    created monitoring-stack network"
 fi
 
-# ---------------------------------------------------------------------------
-# 6. TLS certificate via certbot
-# ---------------------------------------------------------------------------
-
-echo "==> Checking TLS certificate for ${DOMAIN}..."
 if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    CERTBOT_ARGS=(--register-unsafely-without-email)
     if [[ -n "${CERTBOT_EMAIL}" ]]; then
-        certbot certonly --standalone --non-interactive --agree-tos \
-            --email "${CERTBOT_EMAIL}" -d "${DOMAIN}"
-    else
-        certbot certonly --standalone --non-interactive --agree-tos \
-            --register-unsafely-without-email -d "${DOMAIN}"
+        CERTBOT_ARGS=(--email "${CERTBOT_EMAIL}")
     fi
+    certbot certonly --standalone --non-interactive --agree-tos \
+        "${CERTBOT_ARGS[@]}" -d "${DOMAIN}"
 fi
 systemctl enable --now certbot-renew.timer
 
-# ---------------------------------------------------------------------------
-# 7. Nginx directory layout & Database initialization
-# ---------------------------------------------------------------------------
-
-echo "==> Setting up storage directories and database..."
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/conf.d"
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html"
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/logs"
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads"
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads/firmware"
-install -d -o "${DEPLOY_USER}" -g nginx -m 775 "${DEPLOY_HOME}/nginx/html/downloads/webapps"
-install -d -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" -m 700 /var/lib/lightinator/ota-artifacts
-install -d -o root -g "${DEPLOY_USER}" -m 750 /etc/lightinator
-if [[ ! -f /etc/lightinator/version-api.env ]]; then
-    touch /etc/lightinator/version-api.env
-    chown "root:${DEPLOY_USER}" /etc/lightinator/version-api.env
-    chmod 640 /etc/lightinator/version-api.env
+install -d -m 755 "${SYSTEM_ROOT}/etc/containers/systemd"
+install -d -o "${DEPLOY_USER}" -g nginx -m 755 \
+    "${DEPLOY_HOME}/nginx/conf.d" "${WEB_ROOT}" "${DEPLOY_HOME}/nginx/logs"
+if [[ ! -e "${DEPLOY_HOME}/nginx/conf.d/default.conf" ]]; then
+    install -m 644 "${REPO_DIR}/nginx/default.conf" "${DEPLOY_HOME}/nginx/conf.d/default.conf"
+    chcon --reference="${DEPLOY_HOME}/nginx/conf.d" "${DEPLOY_HOME}/nginx/conf.d/default.conf"
 fi
-
-# Migration trigger if legacy version.json is present
-LEGACY_JSON="${DEPLOY_HOME}/nginx/html/version.json"
-TARGET_DB="${REPO_DIR}/firmware.db"
-
-if [[ -f "${LEGACY_JSON}" ]]; then
-    echo "==> Migrating legacy version.json to SQLite database..."
-    runuser -u "${DEPLOY_USER}" -- "${REPO_DIR}/.venv/bin/python" \
-        "${REPO_DIR}/migrate_to_sqlite.py" \
-        --source "${LEGACY_JSON}" \
-        --db "${TARGET_DB}"
-    LEGACY_BACKUP="${LEGACY_JSON}.bak"
-    if [[ -e "${LEGACY_BACKUP}" ]]; then
-        LEGACY_BACKUP="$(mktemp "${LEGACY_JSON}.bak.XXXXXX")"
-        rm "${LEGACY_BACKUP}"
-    fi
-    mv "${LEGACY_JSON}" "${LEGACY_BACKUP}"
-    echo "    Migration complete. Legacy file backed up to ${LEGACY_BACKUP}"
+if ! cmp -s "${REPO_DIR}/containers/nginx.container" "${SYSTEM_ROOT}/etc/containers/systemd/nginx.container"; then
+    install -m 644 "${REPO_DIR}/containers/nginx.container" "${SYSTEM_ROOT}/etc/containers/systemd/nginx.container"
+    systemctl daemon-reload
+    systemctl restart nginx.service
 fi
-
-install -m 644 "${REPO_DIR}/containers/nginx.container" \
-    /etc/containers/systemd/nginx.container
-
-install -m 644 -o "${DEPLOY_USER}" -g nginx \
-    "${REPO_DIR}/nginx/default.conf" \
-    "${DEPLOY_HOME}/nginx/conf.d/default.conf"
-chcon --reference="${DEPLOY_HOME}/nginx/conf.d" \
-    "${DEPLOY_HOME}/nginx/conf.d/default.conf"
-
-systemctl daemon-reload
 systemctl enable --now nginx.service
 
-# ---------------------------------------------------------------------------
-# 8. fail2ban filters & action scripts
-# ---------------------------------------------------------------------------
-
-echo "==> Installing fail2ban configs..."
-mkdir -p /etc/fail2ban/jail.d
-
+# Point our jails directly at the nginx host bind mount.
+FAIL2BAN_CHANGED=0
+SECRET_TEMP="$(mktemp)"
+chmod 600 "${SECRET_TEMP}"
+trap 'rm -f -- "${SECRET_TEMP}"' EXIT
 for template in gh-knocker nginx-podlet-access; do
-    src="${REPO_DIR}/fail2ban/filter.d/${template}.conf"
-    dest="/etc/fail2ban/filter.d/${template}.conf"
-    sed "s/%%DEPLOY_KNOCK_HASH%%/${DEPLOY_KNOCK_HASH}/g" "$src" > "$dest"
+    # Render locally without putting the secret in a subprocess argument.
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        printf '%s\n' "${line//%%DEPLOY_KNOCK_HASH%%/${DEPLOY_KNOCK_HASH}}"
+    done < "${REPO_DIR}/fail2ban/filter.d/${template}.conf" > "${SECRET_TEMP}"
+    destination="${SYSTEM_ROOT}/etc/fail2ban/filter.d/${template}.conf"
+    if ! cmp -s "${SECRET_TEMP}" "${destination}"; then
+        install -m 600 "${SECRET_TEMP}" "${destination}"
+        FAIL2BAN_CHANGED=1
+    fi
 done
-
-install -m 644 "${REPO_DIR}/fail2ban/action.d/f2b-whitelist.conf" \
-    /etc/fail2ban/action.d/f2b-whitelist.conf
-install -m 644 "${REPO_DIR}/fail2ban/jail.d/lightinator.conf" \
-    /etc/fail2ban/jail.d/lightinator.conf
-
+for relative in action.d/f2b-whitelist.conf jail.d/lightinator.conf; do
+    destination="${SYSTEM_ROOT}/etc/fail2ban/${relative}"
+    sed "s|/var/log/nginx/access.log|${DEPLOY_HOME}/nginx/logs/access.log|g" \
+        "${REPO_DIR}/fail2ban/${relative}" > "${SECRET_TEMP}"
+    if ! cmp -s "${SECRET_TEMP}" "${destination}"; then
+        install -m 644 "${SECRET_TEMP}" "${destination}"
+        FAIL2BAN_CHANGED=1
+    fi
+done
+rm -f -- "${SECRET_TEMP}"
+trap - EXIT
+fail2ban-client -t
 systemctl enable --now fail2ban
-systemctl reload fail2ban || systemctl restart fail2ban
+if [[ "${FAIL2BAN_CHANGED}" -eq 1 ]]; then
+    systemctl reload fail2ban
+fi
 
-# ---------------------------------------------------------------------------
-# 9. version-api systemd service installation
-# ---------------------------------------------------------------------------
-
-echo "==> Installing version-api service..."
-install -m 644 "${REPO_DIR}/systemd/version-api.service" \
-    /etc/systemd/system/version-api.service
-
-systemctl daemon-reload
-systemctl enable --now version-api.service
-echo "    version-api service active"
-
-echo ""
-echo "========================================"
-echo "  Setup complete for ${DOMAIN}"
-echo "========================================"
+deploy_application
