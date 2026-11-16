@@ -3,6 +3,20 @@
 
 # lightinator-server
 
+## Public WebUI demo
+
+The installer links to `/api/demo/`, which resolves the newest published
+`5.1/develop` build and serves its compressed package assets under a
+versioned path. The WebUI supplies the browser-local simulation, with no
+server-side controller state shared between visitors. An incompatible or
+incomplete latest build produces an explicit error rather than falling back.
+
+The version API reads packages from
+`/home/github-deploy/nginx/html/download/webui/5.1/develop` by default; set
+`VERSION_DEMO_ROOT` to change this path. `deploy/update.sh` does not install
+the landing page: reconcile `html/index.html` with the live page before
+deploying it. Publish a demo-enabled WebUI before enabling the link.
+
 
 Server-side configuration and tooling for [lightinator.de](https://lightinator.de).
 

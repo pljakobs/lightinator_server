@@ -40,6 +40,18 @@
       a { color: var(--grafana-blue); text-decoration: none; }
       a:hover { text-decoration: underline; }
 
+      .demo-button {
+        display: inline-block;
+        margin-top: 12px;
+        padding: 8px 16px;
+        border-radius: 2px;
+        color: #fff;
+        background: var(--grafana-orange);
+        font-weight: 500;
+      }
+
+      .demo-button:hover { color: #fff; text-decoration: underline; }
+
       pre {
         background: var(--grafana-surface);
         border: 1px solid var(--grafana-border);
@@ -179,6 +191,7 @@
             </div>
           </div>
           <p style="margin: 0; font-size: 0.9em; color: #b0b3b8;">Firmware and Webapp share the controller deliverables. Webapp repo: <a href="https://github.com/pljakobs/esp_rgb_webapp2">esp_rgb_webapp2</a>.</p>
+          <a class="demo-button" href="/api/demo/">Try the UI here</a>
         </div>
       </div>
 

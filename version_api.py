@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import os
 import hashlib
+import gzip
 import io
 import logging
 import hmac
 import json
+import mimetypes
 import re
 import sqlite3
 import tarfile
 import shutil
 import tempfile
 import uuid
+import zlib
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Union
@@ -27,7 +30,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -64,6 +67,7 @@ LISTEN_HOST = os.getenv("VERSION_API_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VERSION_API_PORT", "8765"))
 OPENAPI_URL = "/api/openapi.json"
 DISTRIBUTION_ICON_URL = "/api/brand/lightinator-distribution-server-icon-dark.svg"
+DEMO_ROOT = Path(os.getenv("VERSION_DEMO_ROOT", "/home/github-deploy/nginx/html/download/webui/5.1/develop"))
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +1535,82 @@ def get_webapp_versions(branch: Optional[str] = None, firmware_version: Optional
 
     rows.sort(key=lambda x: parse_version_components(x["version"]), reverse=True)
     return [WebappEntry(**r) for r in rows]
+
+
+def demo_build(version: Optional[str] = None) -> dict:
+    sync_legacy_catalogue()
+    with get_db_connection() as connection:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT version, file_path FROM webapp_builds WHERE branch = ?",
+            ("5.1/develop",),
+        )]
+    if not rows:
+        raise HTTPException(status_code=503, detail="No 5.1/develop WebUI is published")
+    if version is None:
+        record = max(rows, key=lambda row: version_sort_key(row["version"]))
+    else:
+        record = next((row for row in rows if row["version"] == version), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Unknown demo version")
+    name = record["version"]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", ".."):
+        raise HTTPException(status_code=503, detail="Invalid published WebUI version")
+    directory = DEMO_ROOT / name
+    if directory.is_symlink() or not directory.is_dir() or directory.resolve() != Path(record["file_path"]).resolve():
+        raise HTTPException(status_code=503, detail="Published WebUI files are unavailable")
+    return {"version": name, "directory": directory}
+
+
+def demo_asset(directory: Path, name: str) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or any(part in ("", ".", "..") for part in name.split("/")):
+        raise HTTPException(status_code=404, detail="Invalid demo asset")
+    path = directory
+    for part in (name + ".gz").split("/"):
+        path = path / part
+        if path.is_symlink():
+            raise HTTPException(status_code=404, detail="Invalid demo asset")
+    try:
+        return gzip.decompress(path.read_bytes())
+    except (OSError, EOFError, zlib.error):
+        raise HTTPException(status_code=503, detail="Published demo asset is unavailable or invalid")
+
+
+@app.get("/api/demo/", include_in_schema=False)
+def demo_latest():
+    record = demo_build()
+    html = demo_asset(record["directory"], "index.html")
+    if b'name="lightinator-demo"' not in html and b"name=lightinator-demo" not in html:
+        raise HTTPException(status_code=503, detail="The latest 5.1/develop WebUI does not support demo mode yet")
+    for asset in re.findall(rb"""(?:src|href)=["']?/(assets/[A-Za-z0-9._/-]+)""", html):
+        demo_asset(record["directory"], asset.decode("ascii"))
+    demo_asset(record["directory"], "icons/iconsSprite.svg")
+    return RedirectResponse(f"/api/demo/{record['version']}/index.html?demo=1", status_code=302, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/demo/{version}/{name:path}", include_in_schema=False)
+def demo_file(version: str, name: str, demo: str = ""):
+    record = demo_build(version)
+    if name == "index.html":
+        if demo != "1":
+            return RedirectResponse(f"/api/demo/{version}/index.html?demo=1", status_code=302, headers={"Cache-Control": "no-store"})
+        html = demo_asset(record["directory"], name).decode("utf-8")
+        if not re.search(r'name=["\']?lightinator-demo', html):
+            raise HTTPException(status_code=503, detail="This WebUI does not support demo mode")
+        html = re.sub(r'((?:src|href)=["\']?)/(assets/|icons/)', r"\1\2", html)
+        return HTMLResponse(html, headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        })
+    if name == "icons/favicon.ico":
+        icon = record["directory"] / "icons" / "favicon.ico"
+        if icon.is_symlink() or icon.parent.is_symlink() or not icon.is_file():
+            raise HTTPException(status_code=404, detail="Demo icon is unavailable")
+        return Response(icon.read_bytes(), media_type="image/x-icon", headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"})
+    if not (name.startswith("assets/") or name == "icons/iconsSprite.svg"):
+        raise HTTPException(status_code=404, detail="Unknown demo asset")
+    return Response(demo_asset(record["directory"], name), media_type=mimetypes.guess_type(name)[0] or "application/octet-stream", headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"})
 
 
 app.router.routes[:] = [route for route in app.router.routes
