@@ -44,7 +44,7 @@ class DemoTests(unittest.TestCase):
             self.assertEqual(result.headers["location"], "/api/demo/V5.1-10-develop/index.html?demo=1")
             document = client.get("/api/demo/V5.1-9-develop/index.html?demo=1")
             self.assertIn('src="assets/app.js"', document.text)
-            self.assertIn("href=icons/favicon.ico", document.text)
+            self.assertIn("href=data:,", document.text)
             self.assertIn("connect-src 'self'", document.headers["content-security-policy"])
             self.assertEqual(client.get("/api/demo/V5.1-9-develop/assets/app.js").content, b"app")
             self.assertEqual(client.get("/api/demo/V5.1-9-develop/index.html", follow_redirects=False).status_code, 302)
