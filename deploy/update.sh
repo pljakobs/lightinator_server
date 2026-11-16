@@ -4,4 +4,5 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 require_clean_checkout
+backup_system
 deploy_application
