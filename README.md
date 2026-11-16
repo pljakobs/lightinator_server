@@ -13,9 +13,10 @@ incomplete latest build produces an explicit error rather than falling back.
 
 The version API reads packages from
 `/home/github-deploy/nginx/html/download/webui/5.1/develop` by default; set
-`VERSION_DEMO_ROOT` to change this path. `deploy/update.sh` does not install
-the landing page: reconcile `html/index.html` with the live page before
-deploying it. Publish a demo-enabled WebUI before enabling the link.
+`VERSION_DEMO_ROOT` to change this path. Both deployment scripts install the
+landing page after verifying the API can serve the latest demo. Publish a
+demo-enabled WebUI before deploying. Only `html/index.html` is copied into the
+webroot; existing images, flashing manifests and downloads are preserved.
 
 
 Server-side configuration and tooling for [lightinator.de](https://lightinator.de).
@@ -86,7 +87,8 @@ No production publication is performed by the test suite.
 | `fail2ban/jail.d/` | Jail config stanza for all custom jails |
 | `systemd/version-api.service` | systemd unit for `version_api.py` |
 | `deploy/setup.sh` | Idempotent first-run bootstrap (run as root) |
-| `deploy/update.sh` | Pull repo + reload changed services (run as root, called by CI) |
+| `deploy/update.sh` | Deploy the selected clean checkout and verify the demo (run as root) |
+| `deploy/common.sh` | Shared application deployment and managed-file recovery |
 
 ## Server layout
 
@@ -121,11 +123,16 @@ openssl rand -hex 32
 
 | Location | Form | Purpose |
 |----------|------|---------|
-| `knock-secret.env` in the repo root (gitignored) | `DEPLOY_KNOCK_HASH=<hash>` | Read automatically by `setup.sh` and `update.sh`; never committed |
+| `/etc/lightinator/knock-secret.env` (root-owned, mode 600) | `DEPLOY_KNOCK_HASH=<hash>` | Read only by `setup.sh`; never copied into the checkout, webroot, logs or deployment artifacts |
 | GitHub Actions secret `DEPLOY_KNOCK_URL` in `esp_rgbww_firmware` | full URL `https://lightinator.de/deploy-knock-<hash>` | Used by the firmware CI deploy workflow to knock before SSH |
 | GitHub Actions secret `DEPLOY_KNOCK_URL` in `esp_rgb_webapp2` | full URL `https://lightinator.de/deploy-knock-<hash>` | Used by the webapp CI deploy workflow to knock before SSH |
 
-The hash is the same value in all three locations. If it is ever rotated, update all three together then re-run `setup.sh` or `update.sh` with the new `DEPLOY_KNOCK_HASH`.
+The hash is the same value in all three locations. If it is ever rotated, update
+all three together then re-run `setup.sh`. `update.sh` does not read or modify the
+knock configuration. The legacy gitignored checkout-local secret is accepted by
+`setup.sh` with a migration warning; move it outside the checkout. Never copy a
+rendered fail2ban filter back into Git: only placeholder templates are tracked.
+Do not run deployment through a shell tracer or publish its server-side files.
 
 **How it works**
 
@@ -194,7 +201,7 @@ ssh lightinator.de "cat >> /home/github-deploy/.ssh/authorized_keys" \
 
 | Variable | Required by | Notes |
 |----------|-------------|-------|
-| `DEPLOY_KNOCK_HASH` | `setup.sh`, `update.sh` | 64-char hex; never committed |
+| `DEPLOY_KNOCK_HASH` | `setup.sh` | 64-char hex, server-side only; never committed |
 | `CERTBOT_EMAIL` | `setup.sh` | Optional; used for Let's Encrypt account registration |
 | `DEPLOY_USER` | `setup.sh`, `update.sh` | Defaults to `github-deploy` |
 | `DOMAIN` | `setup.sh` | Defaults to `lightinator.de` |
@@ -207,31 +214,64 @@ ssh lightinator.de "cat >> /home/github-deploy/.ssh/authorized_keys" \
 
 ## Initial setup
 
-Clone the repo to the server and run the bootstrap script as root:file:///
+Clone the repo to the server and run the bootstrap script as root:
 
 ```bash
 git clone https://github.com/pljakobs/lightinator_server.git \
     /home/github-deploy/lightinator-server
 
-# Create the gitignored secrets file:
-echo 'DEPLOY_KNOCK_HASH=<64-char hex from server secret>' \
-    > /home/github-deploy/lightinator-server/knock-secret.env
-chmod 600 /home/github-deploy/lightinator-server/knock-secret.env
+# Provision /etc/lightinator/knock-secret.env locally, outside Git.
+# It must be root-owned, mode 600, and define DEPLOY_KNOCK_HASH.
+# Do not put its actual value into a command saved in shell history.
 
 export CERTBOT_EMAIL=admin@lightinator.de   # optional
 bash /home/github-deploy/lightinator-server/deploy/setup.sh
 ```
 
-`setup.sh` is fully idempotent — it installs packages (`podman`, `fail2ban`, `certbot`, `python3`, `firewalld`), creates the `github-deploy` user, opens firewall ports 80/443, creates the Podman `monitoring-stack` network, issues the TLS certificate, deploys all config files, and enables all services.
+`setup.sh` installs host prerequisites, creates the deploy user and monitoring
+network, opens HTTP/HTTPS/SSH services, provisions TLS and configures the
+Lightinator fail2ban templates. Its jails read the nginx host log directory
+directly. Unrelated jails are retained. The demo-enabled WebUI package and any
+installer images/manifests must already be published/provisioned separately.
 
 After setup, add deploy public keys to `/home/github-deploy/.ssh/authorized_keys`.
 
 ## Updating
 
 ```bash
-# Called automatically by CI after rsync deploy, or manually:
-export DEPLOY_KNOCK_HASH=<hash>   # only needed if fail2ban filters changed
+# First select a reviewed, committed revision in a clean server checkout.
+# The script deliberately does not git pull, reset, or resolve production drift.
 sudo bash /home/github-deploy/lightinator-server/deploy/update.sh
+```
+
+Both scripts share application deployment. Repeated updates with unchanged code,
+dependencies and configuration do not reinstall dependencies, restart the API or
+reload nginx. Updates never change fail2ban or the container definition.
+The existing virtualenv (including a symlink) and API environment file are kept.
+The standard deployment paths/user in the systemd unit remain the supported
+production layout.
+
+The legacy catalogue is imported only if the default database is absent, and is
+never moved or overwritten. Existing databases receive schema initialization from
+the API, not a repeated legacy import. A custom database path must be initialized
+explicitly. Deployment state is private under `/var/lib/lightinator/deploy`.
+
+The nginx configuration preserves the `/version.json` database projection.
+Deployment validates nginx configuration, checks the demo directly and through
+nginx, then verifies the landing-page link. Failure exits nonzero and restores
+managed nginx/unit/page files; it does **not** roll back code, dependencies or
+database schema. Before the first production update, reconcile the dirty checkout,
+back up the active SQLite database using SQLite's backup API, and record a known
+good code revision. To recover application code, select that revision, restore a
+compatible database backup if needed, and restart the API. A failed deployment
+does not write the application success stamp, so rerunning retries activation.
+The first rollout must be supervised; this is not a full GitOps release manager.
+
+Validation (no root access or production connections required):
+
+```bash
+bash -n deploy/common.sh deploy/setup.sh deploy/update.sh
+python -m unittest discover -s tests -v
 ```
 
 ## Version API
