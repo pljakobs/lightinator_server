@@ -4,6 +4,7 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 require_clean_checkout
+backup_system
 load_knock_secret
 if [[ -z "${DEPLOY_KNOCK_HASH:-}" ]]; then
     echo "ERROR: Configure /etc/lightinator/knock-secret.env before setup." >&2

@@ -19,6 +19,9 @@ with (root / "commands").open("a") as log:
     log.write(name + " " + " ".join(args) + "\n")
 if name == "git":
     sys.exit(1 if os.environ.get("DIRTY") else 0)
+elif name in ("python3.11", "python3"):
+    if os.environ.get("BAD_BACKUP"):
+        sys.exit(1)
 elif name == "install":
     filtered = []
     while args:
@@ -73,7 +76,7 @@ class DeployTests(unittest.TestCase):
         for command in ("git", "install", "runuser", "python", "pip", "systemctl",
                         "podman", "curl", "sleep", "chown", "chcon", "dnf",
                         "firewall-cmd", "certbot", "getent", "id", "usermod",
-                        "fail2ban-client"):
+                        "fail2ban-client", "python3.11", "python3"):
             path = self.bin / command
             path.write_text(f"#!{sys.executable}\n" + COMMAND)
             path.chmod(0o755)
@@ -152,6 +155,14 @@ class DeployTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("reconcile", result.stderr)
         self.assertEqual((self.root / "commands").read_text().count("\n"), 1)
+
+    def test_backup_failure_prevents_all_changes(self):
+        result = self.deploy(BAD_BACKUP="1")
+        self.assertNotEqual(result.returncode, 0)
+        commands = (self.root / "commands").read_text().splitlines()
+        self.assertEqual(len(commands), 2)
+        self.assertIn("recovery.py backup", commands[1])
+        self.assertEqual((self.web / "index.html").read_text(), "original page\n")
 
     def test_failure_after_page_install_restores_previous_page(self):
         for failure in ("BAD_PROXY", "BAD_PAGE"):

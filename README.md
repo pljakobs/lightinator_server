@@ -89,6 +89,7 @@ No production publication is performed by the test suite.
 | `deploy/setup.sh` | Idempotent first-run bootstrap (run as root) |
 | `deploy/update.sh` | Deploy the selected clean checkout and verify the demo (run as root) |
 | `deploy/common.sh` | Shared application deployment and managed-file recovery |
+| `deploy/recovery.py` | Mandatory private pre-deployment snapshots and standalone restore |
 
 ## Server layout
 
@@ -260,12 +261,75 @@ The nginx configuration preserves the `/version.json` database projection.
 Deployment validates nginx configuration, checks the demo directly and through
 nginx, then verifies the landing-page link. Failure exits nonzero and restores
 managed nginx/unit/page files; it does **not** roll back code, dependencies or
-database schema. Before the first production update, reconcile the dirty checkout,
-back up the active SQLite database using SQLite's backup API, and record a known
-good code revision. To recover application code, select that revision, restore a
-compatible database backup if needed, and restart the API. A failed deployment
+database schema. Before the first production update, reconcile the dirty checkout and record a known
+good code revision. The mandatory snapshot below captures the pre-deployment
+database using SQLite's backup API. A failed deployment
 does not write the application success stamp, so rerunning retries activation.
 The first rollout must be supervised; this is not a full GitOps release manager.
+
+### Pre-deployment backup and restore
+
+Both entry points require a successful private backup **before** installing
+packages/dependencies or modifying configuration. Backups are retained under
+`/var/lib/lightinator/backups/before-deploy-*`, outside Git and the webroot, in
+mode-700 directories. Files are created with a private umask. They contain actual
+server secrets, including the rendered knock filter: **never upload, commit or
+attach these directories to CI jobs, GitHub issues or support reports**.
+
+Each snapshot captures:
+
+- The actual server checkout, including dirty/ignored code and local secrets.
+- The virtualenv, including its external target when the checkout uses a symlink.
+- A consistent SQLite backup of `VERSION_DB_PATH` from the API environment file,
+  or the default checkout database.
+- The landing page, flashing manifests, images, nginx configuration, API service
+  unit, nginx Quadlet, Lightinator environment files and fail2ban configuration.
+- API/nginx/fail2ban active/enabled state, deployment stamps, and firewalld's
+  permanent configuration and runtime/permanent zone reports.
+
+Published download trees, nginx logs, TLS private keys/certificates, Grafana and
+InfluxDB data are excluded. Deployment does not replace these files; setup can
+provision a missing TLS certificate but certificate issuance is not reversed.
+OS packages, container image storage and full firewall-runtime state are not
+snapshotted. This is **not a whole-host snapshot**.
+
+For a standalone snapshot of the current production checkout (even when dirty):
+
+```bash
+sudo python3.11 /path/to/reviewed/deploy/recovery.py backup \
+    --repo /home/github-deploy/lightinator-server \
+    --home /home/github-deploy
+```
+
+The command prints the backup location and its restore command. To recover:
+
+1. Pause firmware/WebUI CI and any other SSH publisher; keep an SSH session open.
+2. Run the independent recovery copy from the chosen backup, **not** from the
+   potentially broken application checkout:
+
+   ```bash
+   sudo python3.11 /var/lib/lightinator/backups/before-deploy-EXAMPLE/recovery.py \
+       restore /var/lib/lightinator/backups/before-deploy-EXAMPLE \
+       --confirm-publishers-paused
+   ```
+
+3. Recovery checks backup integrity and original hostname, stops the three
+   services, retains the failed checkout/virtualenv in sibling
+   `.before-restore-*` directories, restores the code/database/configuration,
+   then reactivates services according to their saved state.
+4. Verify website, catalogue, demo, SSH and fail2ban before resuming publishers.
+
+Firewalld configuration is captured but **not automatically restored or reloaded**:
+it is shared host state, and reloading could disrupt SSH or container networking.
+Reconcile the saved zone reports and archived configuration manually if setup
+changed firewall policy. Other newly created files outside the replaced
+checkout/virtualenv are retained; OS package changes are not undone.
+
+Backup failure aborts deployment. Snapshots have no automatic expiry: check free
+disk space and remove only specifically selected obsolete snapshots after
+successful rollout/recovery validation. The round-trip tests use a temporary
+filesystem with mocked service commands; first production recovery must still be
+supervised.
 
 Validation (no root access or production connections required):
 

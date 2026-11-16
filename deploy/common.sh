@@ -33,6 +33,12 @@ require_clean_checkout() {
     fi
 }
 
+backup_system() {
+    local python="${API_PYTHON:-$(command -v python3.11 || command -v python3)}"
+    "${python}" "${REPO_DIR}/deploy/recovery.py" backup \
+        --repo "${REPO_DIR}" --home "${DEPLOY_HOME}" --system-root "${SYSTEM_ROOT:-/}"
+}
+
 install_changed() {
     local source="$1" destination="$2" mode="${3:-644}"
     if [[ -f "${destination}" ]] && cmp -s "${source}" "${destination}"; then
