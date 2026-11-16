@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Lightinator installer</title>
+    <meta name="viewport" content="width=device-width" />
+    <meta name="color-scheme" content="dark" />
+    <style>
+      :root {
+        --grafana-bg: #111217;
+        --grafana-surface: #181b1f;
+        --grafana-border: #2c3235;
+        --grafana-text: #d8d9da;
+        --grafana-orange: #f05a28;
+        --grafana-blue: #3274d9;
+      }
+
+      body {
+        font-family: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        background-color: var(--grafana-bg);
+        color: var(--grafana-text);
+        padding: 0;
+        margin: 0;
+        line-height: 1.6;
+      }
+
+      .content {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      h1, h2, h3 {
+        color: #fff;
+        font-weight: 500;
+      }
+
+      h1 { border-bottom: 1px solid var(--grafana-border); padding-bottom: 10px; }
+
+      a { color: var(--grafana-blue); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      .demo-button {
+        display: inline-block;
+        margin-top: 12px;
+        padding: 8px 16px;
+        border-radius: 2px;
+        color: #fff;
+        background: var(--grafana-orange);
+        font-weight: 500;
+      }
+
+      .demo-button:hover { color: #fff; text-decoration: underline; }
+
+      pre {
+        background: var(--grafana-surface);
+        border: 1px solid var(--grafana-border);
+        padding: 12px;
+        border-radius: 4px;
+        color: #73bf69; /* Terminal green */
+        overflow-x: auto;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 20px 0;
+        background: var(--grafana-surface);
+      }
+
+      td {
+        padding: 12px;
+        border: 1px solid var(--grafana-border);
+      }
+
+      .radios {
+        padding: 0;
+        display: flex;
+        gap: 20px;
+      }
+
+      .radios li { list-style: none; }
+
+      /* Styling the ESP Install Button to look like a Grafana Action Button */
+      esp-web-install-button {
+        --esp-tools-button-border-radius: 2px;
+        --esp-tools-button-color: var(--grafana-orange);
+      }
+
+      .component-card {
+        background: var(--grafana-surface);
+        border: 1px solid var(--grafana-border);
+        padding: 16px;
+        border-radius: 4px;
+        margin-bottom: 16px;
+        display: flex;
+        align-items: flex-start;
+        gap: 16px;
+      }
+
+      .component-icon {
+        width: 64px !important;
+        height: 64px !important;
+        min-width: 64px;
+        min-height: 64px;
+        max-width: 64px;
+        max-height: 64px;
+        object-fit: contain;
+        border-radius: 4px;
+        flex-shrink: 0;
+      }
+
+      .component-info {
+        flex-grow: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .component-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .footer {
+        margin-top: 40px;
+        border-top: 1px solid var(--grafana-border);
+        padding: 20px;
+        font-size: 0.9em;
+        color: #7b7e83;
+      }
+
+      .release-notes-box {
+        background: var(--grafana-surface);
+        border: 1px solid var(--grafana-border);
+        border-radius: 4px;
+        padding: 12px 16px;
+        margin: 20px 0;
+      }
+
+      .release-notes-box summary {
+        cursor: pointer;
+        color: #fff;
+        font-weight: 500;
+      }
+
+      .release-notes-box summary:hover {
+        color: var(--grafana-orange);
+      }
+
+      #release-notes-content h1,
+      #release-notes-content h2,
+      #release-notes-content h3 {
+        font-size: 1.1em;
+        margin-top: 10px;
+        margin-bottom: 5px;
+        color: #fff;
+      }
+
+      #release-notes-content ul {
+        padding-left: 20px;
+        margin: 5px 0;
+      }
+
+      .invisible { visibility: hidden; }
+    </style>
+    <script type="module" src="https://unpkg.com/esp-web-tools@8.0.1/dist/web/install-button.js?module"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  </head>
+  <body>
+    <div class="content">
+    <img src="images/lightinator_full-dark.svg" alt="Lightinator Logo" height="128">
+
+      <h1>Lightinator Installer</h1>
+
+      <h3>Components & Repositories</h3>
+
+      <!-- Firmware & Webapp Card -->
+      <div class="component-card">
+        <img src="images/lightinator-controller-dark.png" alt="Firmware Icon" width="96" height="96" class="component-icon">
+        <div class="component-info">
+          <div class="component-header">
+            <strong><a href="https://github.com/pljakobs/esp_rgbww_firmware">Lightinator Firmware & Webapp</a></strong>
+            <div>
+              <a href="https://github.com/pljakobs/esp_rgbww_firmware/actions/workflows/build_firmware.yml"><img src="https://github.com/pljakobs/esp_rgbww_firmware/actions/workflows/build_firmware.yml/badge.svg" alt="firmwareBuild"></a>
+              <a href="https://github.com/pljakobs/esp_rgb_webapp2/actions/workflows/deploy.yml"><img src="https://github.com/pljakobs/esp_rgb_webapp2/actions/workflows/deploy.yml/badge.svg" alt="frontendBuild"></a>
+            </div>
+          </div>
+          <p style="margin: 0; font-size: 0.9em; color: #b0b3b8;">Firmware and Webapp share the controller deliverables. Webapp repo: <a href="https://github.com/pljakobs/esp_rgb_webapp2">esp_rgb_webapp2</a>.</p>
+          <a class="demo-button" href="/api/demo/">Try the UI here</a>
+        </div>
+      </div>
+
+      <!-- Home Assistant Module Card -->
+      <div class="component-card">
+        <img src="images/lightinator-ha-dark.png" alt="HA Module Icon" width="96" height="96" class="component-icon">
+        <div class="component-info">
+          <div class="component-header">
+            <strong><a href="https://github.com/pljakobs/Lightinator_HA_module">Lightinator Home Assistant Integration</a></strong>
+            <div>
+              <a href="https://github.com/pljakobs/Lightinator_HA_module/actions/workflows/release.yml"><img src="https://github.com/pljakobs/Lightinator_HA_module/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+            </div>
+          </div>
+          <div>
+            <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fpljakobs%2Flightinator_HA_module">
+              <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Add repository to Home Assistant">
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- Log Service Card -->
+      <div class="component-card">
+        <img src="images/lightinator-log-dark.png" alt="Log Service Icon" width="96" height="96" class="component-icon">
+        <div class="component-info">
+          <div class="component-header">
+            <strong><a href="https://github.com/pljakobs/lightinator-log-service">Lightinator Log Service</a></strong>
+            <div>
+              <a href="https://github.com/pljakobs/lightinator-log-service/actions/workflows/container-image.yml"><img src="https://github.com/pljakobs/lightinator-log-service/actions/workflows/container-image.yml/badge.svg" alt="CI"></a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Release Notes Foldup -->
+      <details class="release-notes-box">
+        <summary><strong>Firmware Release Notes</strong> (Experimental)</summary>
+        <div id="release-notes-content" style="margin-top: 12px; font-size: 0.9em; color: var(--grafana-text);">
+          <p><em>Loading release notes...</em></p>
+        </div>
+      </details>
+
+      <p>Select your firmware type:</p>
+      <ul class="radios">
+        <li><label><input type="radio" name="type" value="debug" /> Debug</label></li>
+        <li><label><input type="radio" name="type" value="release" /> Release</label></li>
+      </ul>
+
+      <div class="button-row" style="text-align: center; margin: 30px 0;">
+        <esp-web-install-button class="invisible"></esp-web-install-button>
+      </div>
+
+      <h3>Direct Downloads</h3>
+      <table>
+          <tr>
+              <td><strong>ESP8266</strong></td>
+              <td><a href="./download/esp8266/develop/debug/app-merged.bin">Debug</a></td>
+              <td><a href="./download/esp8266/develop/release/app-merged.bin">Release</a></td>
+          </tr>
+          <tr>
+              <td><strong>ESP32</strong></td>
+              <td><a href="./download/esp32/develop/debug/app-merged.bin">Debug</a></td>
+              <td><a href="./download/esp32/develop/release/app-merged.bin">Release</a></td>
+          </tr>
+          <tr>
+              <td><strong>ESP32-C3</strong></td>
+              <td><a href="./download/esp32c3/develop/debug/app-merged.bin">Debug</a></td>
+              <td><a href="./download/esp32c3/develop/release/app-merged.bin">Release</a></td>
+          </tr>
+      </table>
+
+      <h3>Manual Installation</h3>
+      <p>Flash images to address <code>0x000000</code>. On Linux:</p>
+      <pre>pip install esptool
+python -m esptool --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x0 app-merged.bin</pre>
+
+      <div class="footer">
+        Installer powered by ESP Web Tools
+      </div>
+    </div>
+
+    <script>
+      document.querySelectorAll('input[name="type"]').forEach(radio =>
+        radio.addEventListener("change", () => {
+          const button = document.querySelector('esp-web-install-button');
+          button.manifest = `./manifest_${radio.value}.json`;
+          button.classList.remove('invisible');
+        }
+      ));
+      fetch('https://raw.githubusercontent.com/pljakobs/esp_rgbww_firmware/refs/heads/experimental/RELEASE_NOTES.md')
+        .then(response => response.text())
+        .then(markdown => {
+          document.getElementById('release-notes-content').innerHTML = marked.parse(markdown);
+        })
+        .catch(error => {
+          document.getElementById('release-notes-content').innerHTML = '<p style="color: #f05a28;">Failed to load release notes.</p>';
+        });
+    </script>
+  </body>
+</html>
